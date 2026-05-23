@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "liqsignal"
+version = "0.1.0"
+description = "Liquidation-driven maker-trade filter for the Binance perpetual"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "polars==1.36.1",
+    "pyarrow==21.0.0",
+    "pandas==2.3.3",
+    "numpy==2.0.2",
+    "matplotlib==3.9.4",
+    "seaborn==0.13.2",
+    "scikit-learn==1.6.1",
+    "joblib==1.4.2",
+]
+
+[project.optional-dependencies]
+notebook = ["jupyter==1.1.1", "notebook==7.5.6", "ipykernel==6.31.0"]
+dev = ["pytest==8.3.4"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

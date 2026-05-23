@@ -1,0 +1,16 @@
+# environments & data
+.venv/
+data/
+data_test/
+artifacts/
+
+# python build/cache
+build/
+*.egg-info/
+src/*.egg-info/
+__pycache__/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# os
+.DS_Store
