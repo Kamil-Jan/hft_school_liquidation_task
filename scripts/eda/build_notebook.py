@@ -15,10 +15,10 @@ md(r"""
 # Liquidation-signal datasets — exploratory data analysis
 
 **Goal of this notebook:** build intuition about the four datasets described in `description.md`
-(Binance trades / BBO / liquidations + Bybit liquidations, 90 days of `perp:btcusdt` & `perp:ethusdt`)
+(Binance trades / BBO / liquidations + Bybit liquidations, 179 days of `perp:btcusdt` & `perp:ethusdt`)
 through pure exploration. No signal is built here — we only look at the data and write down what is there.
 
-The raw trades/BBO files are huge (≈1.1 B trade rows, ≈207 M BBO rows, ~6.5 GB on disk), so heavy
+The raw trades/BBO files are huge (≈2.2 B trade rows, ≈420 M BBO rows, ~13 GB on disk), so heavy
 aggregations are done once by `precompute_agg.py` (streaming group-bys) and `precompute_events.py`
 (forward-filled BBO mid around events). Both write small tables into `artifacts/`. This notebook loads
 those artifacts plus the small liquidation files directly, so it runs in seconds and is fully reproducible.
@@ -26,7 +26,7 @@ those artifacts plus the small liquidation files directly, so it runs in seconds
 **Map of the notebook**
 1. Inventory & shape — how much data, over what span
 2. Time structure — distribution in time, gaps, day/night, burstiness
-3. Price context — what the market did over the quarter
+3. Price context — what the market did over the window
 4. Distributions — sizes, notionals, spreads, side balance, heavy tails
 5. The conventions that bite — timestamp units, `side` meaning, the Bybit +200 ms delay (verified by hand)
 6. Cross-source relationships — order book around trades & liquidations, cross-exchange alignment
@@ -107,9 +107,9 @@ inv
 md(r"""
 **What we see**
 
-* All eight tables cover the **same 90-day window, 2025-12-01 → 2026-02-28 UTC** — train (Dec–Jan) + validation (Feb).
-* **Trades dominate**: ETH ≈706 M, BTC ≈402 M rows. **BBO** is ≈100–108 M each. **Liquidations are tiny** (0.1–0.2 M).
-* A first surprise: **Bybit reports *more* liquidations than Binance** for both symbols (BTC 229 K vs 114 K; ETH 160 K vs 132 K), despite Bybit being a smaller venue. We will see Bybit also liquidates more *notional*.
+* All eight tables cover the **same 179-day window, 2025-11-01 → 2026-04-28 UTC** — train (Nov–Feb) + validation (Mar) + test (Apr) under the default `config.USE_TEST=True` split.
+* **Trades dominate**: ETH ≈1.37 B, BTC ≈804 M rows. **BBO** is ≈203–220 M each. **Liquidations are tiny** (0.2–0.4 M).
+* A first surprise: **Bybit reports *more* liquidations than Binance** for both symbols (BTC 438 K vs 236 K; ETH 302 K vs 271 K), despite Bybit being a smaller venue. We will see Bybit also liquidates more *notional*.
 * ETH has ~1.75× the trade count of BTC but, as we will see, much smaller notional per trade.
 """)
 
@@ -140,14 +140,19 @@ for exch in ["binance", "bybit"]:
         axes[2].plot(min_to_dt(dd["day"]*1440), dd["n"], ls, color=COL[sym],
                      label=f"{exch} {sym}", alpha=0.85)
 axes[2].set_ylabel("liquidations / day"); axes[2].legend(loc="upper left", ncol=2)
-axes[2].axvline(np.datetime64("2026-02-01"), color="k", lw=0.8, ls=":")
-axes[2].text(np.datetime64("2026-02-01"), axes[2].get_ylim()[1]*0.9, " val split", fontsize=8)
+def _splitline(us, label, yfrac):
+    x = np.datetime64(int(us)//1_000_000, "s")
+    axes[2].axvline(x, color="k", lw=0.8, ls=":")
+    axes[2].text(x, axes[2].get_ylim()[1]*yfrac, f" {label}", fontsize=8)
+_splitline(config.VAL_START, "val", 0.9)          # boundaries come from config (single source of truth)
+if config.USE_TEST:
+    _splitline(config.TEST_START, "test", 0.78)
 fig.suptitle("Daily volume by source", y=1.0); plt.tight_layout(rect=[0,0,1,0.97]); plt.show()
 """)
 md(r"""
 * Trade and BBO volume is **fairly stable day-to-day** with clear spikes on volatile days. BBO ticks/day are an order of magnitude below trades — the book-ticker feed is event-throttled (~13 ticks/s), so **trades, not BBO, set the time resolution**.
 * Liquidations are **spiky**: most days are quiet, punctuated by cascade days where counts jump 5–20×. Bybit (dashed) sits above Binance (solid) for most days.
-* The dotted line marks the train/validation split (Feb 1). Nothing structurally changes there — same regime, same feeds.
+* The dotted line(s) mark the validation (and test, if enabled) split boundaries read from `config`. Volume is structurally continuous across them — the feeds don't change — but, as the model report shows, the *return regime* does shift between months.
 """)
 
 md("### 2.2 Day/night cycle (hour-of-day, UTC)")
@@ -175,7 +180,7 @@ md(r"""
 
 md("### 2.3 Burstiness and gaps")
 code(r"""
-print("Per-minute trade-count burstiness (90 days = 129,600 minutes):")
+print("Per-minute trade-count burstiness (179 days ≈ 257,760 minutes):")
 for sym in SYMS:
     n = pl.read_parquet(ART/f"trades_minute_{sym}.parquet")["n"]
     print(f"  {sym}: minutes={len(n):,}  min={n.min()}  median={int(n.median())}  "
@@ -191,14 +196,14 @@ for sym in SYMS:
 """)
 md(r"""
 * **Never a dead minute** in trades (min 29 BTC / 58 ETH per minute) — the tape is continuous; the burstiness is entirely volatility-driven (busiest minute is 74–87× the median).
-* **BBO is ~99.99% complete**: only 6 (BTC) / 9 (ETH) missing minutes in 90 days, and they fall on the **same wall-clock minutes** for both symbols (e.g. 2025-12-22 02:07, 2026-02-26 13:30–13:32) → these are exchange/collector-wide gaps, not symbol-specific corruption. Worth remembering for forward-fill: a few multi-minute holes exist.
+* **BBO is ~99.99% complete**: only a handful of missing minutes (see the cell output for the exact list), and they fall on the **same wall-clock minutes** for both symbols → exchange/collector-wide outages, not symbol-specific corruption. Worth remembering for forward-fill: a few multi-minute holes exist.
 """)
 
 # ----------------------------------------------------------------------------
 md(r"""
 ## 3. Price context
 
-What did the market actually do over the quarter? This frames everything else — liquidation skew, volatility clustering, etc.
+What did the market actually do over the window? This frames everything else — liquidation skew, volatility clustering, etc.
 """)
 code(r"""
 fig, axes = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
@@ -218,8 +223,8 @@ for ax, sym in zip(axes, SYMS):
 axes[1].xaxis.set_major_formatter(mdates.DateFormatter("%b %d")); plt.tight_layout(); plt.show()
 """)
 md(r"""
-* **BTC fell from ~$90 K (early Dec) to a ~$60 K trough and partially recovered** — a large drawdown quarter; ETH tracks it (3446 → 1736 range). The big red liquidation-notional bars line up with the sharp legs down.
-* This explains the **sell-side skew in liquidations** we quantify below: a falling market forces long liquidations (sell-side). It also means any signal must be robust to a trending, not just choppy, regime.
+* BTC and ETH trade through a **wide range over the window** (see the chart — the data spans Nov 2025 → Apr 2026, covering more than one regime). The big red liquidation-notional bars line up with the sharp legs down.
+* This frames the **sell-side skew in liquidations** quantified below: down-legs force long liquidations (sell-side). It also means any signal must be robust **across regimes** (the validation and test months behave differently), not just one trend.
 """)
 
 # ----------------------------------------------------------------------------
@@ -354,10 +359,10 @@ for unit, div in [("seconds",1), ("milliseconds",1e3), ("microseconds",1e6), ("n
         print(f"  if {unit:12s}: {dt}")
     except (OverflowError, OSError, ValueError) as e:
         print(f"  if {unit:12s}: out of range ({e})")
-print("\n=> Only 'microseconds' lands in 2025-12; ms -> year ~57000, ns -> 1970. Confirmed: int64 microseconds UTC.")
+print("\n=> Only 'microseconds' lands in 2025-11; ms -> year ~57000, ns -> 1970. Confirmed: int64 microseconds UTC.")
 """)
 md(r"""
-**Confirmed.** Dividing by 1e6 gives 2025-12-01 00:00:00.047 UTC; any other unit is absurd. Throughout, `timestamp / 1e6` = epoch seconds.
+**Confirmed.** Dividing by 1e6 gives a 2025-11-01 UTC instant (the first row); any other unit is absurd. Throughout, `timestamp / 1e6` = epoch seconds.
 """)
 
 md(r"""### 5.2 `side` means different things in `trades` vs `liquidations`
@@ -437,13 +442,15 @@ fig, axes = plt.subplots(1, 2, figsize=(12, 4.2))
 size_q = {"btc":[0,1e3,1e4,1e5,1e12], "eth":[0,1e2,1e3,1e4,1e12]}
 for ax, sym in zip(axes, SYMS):
     ti = pl.read_parquet(ART/f"trade_impact_{sym}.parquet").filter(pl.col("m_pre").is_not_nan())
-    impc = [c for c in ti.columns if c.startswith("imp_")]
-    offs = sorted(float(c[4:]) for c in impc)
+    # pair each offset with its actual column name (numpy float64 names whole seconds
+    # as "imp_-1", not "imp_-1.0", so don't rebuild the name from the parsed float)
+    off_cols = sorted((float(c[4:]), c) for c in ti.columns if c.startswith("imp_"))
+    offs = [o for o, _ in off_cols]
     edges = size_q[sym]
     for i in range(len(edges)-1):
         sub = ti.filter((pl.col("notional")>=edges[i])&(pl.col("notional")<edges[i+1]))
         if sub.height < 50: continue
-        ys = [float(np.nanmean(sub[f"imp_{o}"].to_numpy())) for o in offs]
+        ys = [float(np.nanmean(sub[col].to_numpy())) for _, col in off_cols]
         lbl = f"${edges[i]:,.0f}–{edges[i+1]:,.0f}" if edges[i+1]<1e12 else f">${edges[i]:,.0f}"
         ax.plot(offs, ys, marker="o", ms=3, label=lbl)
     ax.axvline(0, color="k", lw=0.6); ax.axhline(0, color="k", lw=0.4)
@@ -565,12 +572,12 @@ print("\n4. Markout boundary: 1-2 liquidations in the final 300 s of the sample 
 print("   BBO tick and are correctly excluded (NaN) per the description's rule.")
 
 print("\n5. Clean where it counts: 0 crossed/locked books, 0 non-positive spreads, 0 zero-size trades,")
-print("   0 null/NaN prices across all 207M BBO rows and 1.1B trades.")
+print("   0 null/NaN prices across all ~420M BBO rows and ~2.2B trades.")
 """)
 md(r"""
 None of these are corrupting; they are the kind of thing that silently breaks a pipeline if ignored:
 * **Sort Bybit** (and apply +200 ms) before joining — its rows are mildly out of order.
-* **Forward-fill across the BBO gaps** is fine but be aware a few `t+τ` lookups span a multi-minute hole (esp. 2026-02-26 13:30–13:32).
+* **Forward-fill across the BBO gaps** is fine but be aware a few `t+τ` lookups span a multi-minute hole (see the gap list above).
 * **Drop trades whose `t+τ` exceeds the BBO end** (handful at the sample tail), as the markout spec says.
 """)
 
@@ -579,14 +586,14 @@ md(r"""
 ## 8. Summary of findings
 
 **Shape & integrity**
-* 90 days (2025-12-01 → 2026-02-28 UTC), 8 tables, identical span. ≈1.1 B trades, ≈207 M BBO ticks, ~0.63 M liquidations total.
+* 179 days (2025-11-01 → 2026-04-28 UTC), 8 tables, identical span. ≈2.2 B trades, ≈420 M BBO ticks, ~1.2 M liquidations total.
 * Data is clean: no crossed books, zero/negative prices, or NaNs. BBO ~99.99% complete (a few shared multi-minute outages). Trades never stop.
 * **Timestamps are int64 microseconds UTC** — verified by hand.
 
 **Distributions**
 * Trade & liquidation notionals are **heavy-tailed / log-normal-ish**; BTC median trade ~$255, ETH ~$40. The `min(notional, $100K)` weight clips only the top ~1%.
 * **Spreads are ~1 tick almost always** (BTC ~0.011 bps, ETH ~0.034 bps median) → the +0.5 bps rebate and the markout dominate maker PnL, not the spread.
-* **Trade flow is ~50/50**; **liquidations skew sell-side** (Bybit most of all), tracking the BTC drawdown.
+* **Trade flow is ~50/50**; **liquidations skew sell-side** (Bybit most of all), tracking the market's down-legs.
 
 **The conventions that bite (all verified)**
 * `side` in trades = taker side (buy prints ≥ mid 98% of the time). `side` in liquidations = liq-order side, and the price-response confirms buy=upward / sell=downward pressure.
@@ -594,7 +601,7 @@ md(r"""
 
 **Cross-source relationships (the signal thesis)**
 * A liquidation marks the **local extreme** of a fast move, shows a tiny same-direction continuation (~1–2 s), then a **multi-minute reversion** of the Binance mid.
-* **Bybit liquidations predict that reversion ~10× more strongly than Binance's own** (e.g. ETH sell-liqs ≈ +15 bps at 300 s), and the effect survives the 200 ms delay — the single most promising relationship in the data.
+* **Bybit liquidations predict that reversion ~10× more strongly than Binance's own** (quantified in §6), and the effect survives the 200 ms delay — the single most promising relationship in the data.
 * Taker trades carry **persistent, size-scaling impact** (adverse selection) — the other side of what a maker filter must manage.
 
 **Where I'd look next** (for the eventual filter, beyond this week)

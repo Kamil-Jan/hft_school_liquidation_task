@@ -8,7 +8,9 @@ trade / BBO / liquidation data (Binance + Bybit) so the *kept* trades have a bet
 markout than the unfiltered baseline, subject to a $500k/day kept-turnover floor.
 The deliverable is a function `signal(trades, bbo, liq_binance, liq_bybit)` returning,
 for each τ ∈ {30,120,300}s, a 0/1 array (1 = filter out). Spec: [`description.md`](description.md)
-(in Russian). Data is 90 days, 2025-12-01 → 2026-02-28 UTC.
+(in Russian). Data is 179 days, 2025-11-01 → 2026-04-28 UTC. The train/val/test split
+is configurable in `config.py` (four dates + a `USE_TEST` toggle; leak-safe embargo) —
+see [`.claude/docs/data-and-conventions.md`](.claude/docs/data-and-conventions.md).
 
 ## Where things are
 - **`src/liqsignal/`** — installable package (`pip install -e .`). Modules:
@@ -16,12 +18,14 @@ for each τ ∈ {30,120,300}s, a 0/1 array (1 = filter out). Spec: [`description
   `markout` (spec PnL math), `scoring` (Score + turnover), `features`
   (feature engineering), `analysis` (study + thresholding), `model` (per-τ HistGBR),
   `baselines`, `report`, `signal` (submission entry point).
-- **`scripts/`** — thin runners: `compute_baselines.py`, `build_panel.py`,
-  `run_study.py`, `train_model.py`; `scripts/eda/` builds the exploration notebook.
-- **`notebooks/01_exploration.ipynb`** — executed EDA narrative (11 charts).
-- **`tests/`** — pytest (22 tests; spec math + features + thresholding + signal).
+- **`scripts/`** — thin runners: `compute_baselines.py`, `build_flow_grid.py`, `build_panel.py`,
+  `run_study.py`, `train_model.py`, `evaluate.py`, `build_feature_selection_nb.py`,
+  `select_features.py`; `scripts/eda/` builds the exploration notebook.
+- **`notebooks/01_exploration.ipynb`** (EDA, 11 charts) and
+  **`02_feature_selection.ipynb`** (`make feature-selection`) — executed narratives.
+- **`tests/`** — pytest (31 tests; spec math + features + thresholding + signal + model).
 - **`artifacts/`** — all computed outputs (gitignored): `baselines.parquet`,
-  `panel_<sym>.parquet`, `model_<tau>.joblib`, `report/`, EDA tables.
+  `flow_grid_<sym>.parquet`, `panel_<sym>.parquet`, `model_<sym>_<tau>.joblib`, `report/`, EDA tables.
 - **`.venv`** — Python 3.9 venv (system python; no uv/homebrew). Polars 1.36, sklearn 1.6.1.
 
 ## How to run (Makefile)
@@ -43,7 +47,7 @@ Pipeline order from scratch: `install → panel → train` (and `baselines` for 
 - **Bybit liquidations:** apply **+200 ms** before comparing to Binance time, AND
   **sort first** — the Bybit feed is *not* time-sorted and has µs-collisions.
   (`io.liquidations_from_frame` handles both.)
-- **16 GB RAM.** Trade files are 400–700 M rows; never load whole. Polars
+- **16 GB RAM.** Trade files are 800 M–1.4 B rows (BBO ~200 M); never load whole. Polars
   `join_asof` OOMs on ETH — use the chunked/`searchsorted` patterns in
   `baselines.py` / `io.iter_trade_batches` / `signal._model_signal`.
 - **Spreads are ~1 tick** (median ≈0.01–0.03 bps) → the +0.5 bps rebate and the
@@ -53,12 +57,15 @@ Pipeline order from scratch: `install → panel → train` (and `baselines` for 
 
 ## Current state (2026-05-23)
 EDA done; signal pipeline + a combined per-τ model shipped. The model
-(`HistGradientBoostingRegressor`, 45 features, sample-weighted by `w_i`, pooled
-BTC+ETH) + a Score-maximising threshold **beats the single-feature keep-10% baseline
-on validation everywhere** (e.g. ETH τ30 3.07 vs 1.94 bps). Top features:
-`bybit_liqabs_300s`, `hour`, `bybit_liqalign_300s`, `ampl_300s` (Bybit > Binance,
-confirming the cross-exchange liquidation-reversion thesis). See
-`artifacts/report/report.md` after `make train`.
+(`HistGradientBoostingRegressor`, 73 features inc. tape-flow/cascade/regime/funding,
+optionally pruned to top-N, sample-weighted by `w_i`, **one model per (symbol, τ)** —
+`signal()` infers the symbol and loads `model_<sym>_<tau>.joblib`) + a Score-maximising
+threshold (purged-CV fit, persisted with each model and applied by `signal()` by default) **beats the single-feature keep-10% baseline on validation
+everywhere** (e.g. ETH τ30 3.07 vs 1.94 bps). Top features: `bybit_liqabs_300s`,
+`hour`, `bybit_liqalign_300s`, `ampl_300s` (Bybit > Binance, confirming the
+cross-exchange liquidation-reversion thesis). Every feature is catalogued in
+[`.claude/docs/features.md`](.claude/docs/features.md). See `artifacts/report/report.md`
+after `make train`.
 
 ## Core thesis
 A liquidation marks the local extreme of a fast move → tiny same-direction
@@ -69,6 +76,7 @@ survives the +200 ms delay. The filter keeps trades whose predicted markout is h
 ## Deeper docs
 - [`.claude/docs/architecture.md`](.claude/docs/architecture.md) — package design, data flow, how to extend.
 - [`.claude/docs/data-and-conventions.md`](.claude/docs/data-and-conventions.md) — schemas, scale, quirks, the conventions in detail.
+- [`.claude/docs/features.md`](.claude/docs/features.md) — the 51 model features: definition, units, rationale.
 - [`.claude/docs/findings.md`](.claude/docs/findings.md) — EDA + signal + model results.
 - [`.claude/docs/workflows-and-gotchas.md`](.claude/docs/workflows-and-gotchas.md) — commands, recipes, memory patterns, pitfalls.
 - [`.claude/docs/roadmap.md`](.claude/docs/roadmap.md) — done / next / open questions.

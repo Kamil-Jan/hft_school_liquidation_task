@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 
 # Resolve --data-dir before importing liqsignal: config.DATA_DIR reads the env at
 # import time, so the override must be set first.
@@ -72,7 +73,7 @@ def _score_single(sym: str, book: io.BookTop, bbo, liq_b, liq_y) -> dict[int, di
     w = np.minimum(price * trades["amount"].to_numpy(), config.NOTIONAL_CAP)
     n_days = int(np.unique(t // config.DAY_US).size)
 
-    f_by_tau = signal(trades, bbo, liq_b, liq_y)
+    f_by_tau = signal(trades, bbo, liq_b, liq_y, symbol=sym)
     out = {}
     for tau in config.TAUS:
         pnl = compute_markout(t, sign, price, book.ts, book.mid, tau)
@@ -98,7 +99,7 @@ def _score_batched(sym: str, book: io.BookTop, bbo, liq_b, liq_y, batch_size: in
         w = np.minimum(price * amount, config.NOTIONAL_CAP)
         days.update(np.unique(t // config.DAY_US).tolist())
         chunk = pl.DataFrame({"timestamp": t, "side": side, "price": price, "amount": amount})
-        f_by_tau = signal(chunk, bbo, liq_b, liq_y)
+        f_by_tau = signal(chunk, bbo, liq_b, liq_y, symbol=sym)
         for tau in config.TAUS:
             pnl = compute_markout(t, sign, price, book.ts, book.mid, tau)
             keep = 1.0 - f_by_tau[tau].astype(float)
@@ -132,21 +133,27 @@ def main() -> None:
     p.add_argument("--out", default=None, help="optional parquet path for the metrics table")
     args = p.parse_args()
 
-    print(f"data dir : {config.DATA_DIR}")
-    print(f"symbols  : {args.symbols}   taus: {list(config.TAUS)}\n")
+    print(f"data dir : {config.DATA_DIR}", flush=True)
+    print(f"symbols  : {args.symbols}   taus: {list(config.TAUS)}\n", flush=True)
 
     rows = []
     for sym in args.symbols:
+        t0 = time.perf_counter()
+        n_trades = io.row_count("trades", sym)
+        print(f"scoring {sym}: {n_trades:,} trades "
+              f"({'batched' if args.batch_size > 0 else 'single-shot'}) ...", flush=True)
         bbo, liq_b, liq_y, book = _read_context(sym)
         res = (_score_batched(sym, book, bbo, liq_b, liq_y, args.batch_size)
                if args.batch_size > 0
                else _score_single(sym, book, bbo, liq_b, liq_y))
+        print(f"  {sym} done in {time.perf_counter() - t0:.1f}s", flush=True)
         for tau in config.TAUS:
             m = res[tau]
             flag = "OK" if m["constraint_ok"] else "VIOLATION"
             print(f"  {sym} tau={tau:>3}:  Score={m['score']:+.3f}  "
                   f"PnL_kept={m['pnl_kept']:+.3f}  PnL_all={m['pnl_all']:+.3f}  "
-                  f"keep={m['frac_kept']:.1%}  keptTurn/day={m['kept_turnover_per_day']:,.0f}  {flag}")
+                  f"keep={m['frac_kept']:.1%}  keptTurn/day={m['kept_turnover_per_day']:,.0f}  {flag}",
+                  flush=True)
             rows.append(dict(sym=sym, tau=tau, **m))
 
     table = pl.DataFrame(rows).sort(["sym", "tau"])

@@ -37,6 +37,7 @@ US = config.US
 MOMENTUM_WINDOWS_S: tuple[int, ...] = (1, 5, 30)
 REALIZED_WINDOWS_S: tuple[int, ...] = (5, 30, 300)
 LIQUIDITY_WINDOWS_S: tuple[int, ...] = (5, 30, 300)
+FLOW_WINDOWS_S: tuple[int, ...] = (30, 300)   # tape-flow feature windows
 BASIS_MAX_STALE_S: float = 300.0   # ignore the Bybit basis proxy if no liq within this
 
 # Columns that are NOT model features (meta / label / identifiers).
@@ -100,6 +101,55 @@ def cascade_acceleration(cnt_short: np.ndarray, cnt_long: np.ndarray,
     return out
 
 
+def liq_run_length(side: np.ndarray) -> np.ndarray:
+    """Signed run-length of consecutive same-side liquidations ending at each event.
+
+    `+k` for a run of k consecutive buy-side liqs, `−k` for sell-side. Vectorised.
+    """
+    n = len(side)
+    if n == 0:
+        return np.zeros(0, dtype=np.float64)
+    change = np.concatenate([[True], side[1:] != side[:-1]])
+    idx = np.arange(n)
+    last_change = np.where(change, idx, 0)
+    np.maximum.accumulate(last_change, out=last_change)
+    run = (idx - last_change + 1).astype(np.float64)
+    return np.where(side == "buy", run, -run)
+
+
+def liq_zscore(abs_notional: np.ndarray, window: int = 200, min_periods: int = 20) -> np.ndarray:
+    """Rolling z-score of each liquidation's |notional| vs the trailing-event distribution.
+
+    NaN until ``min_periods`` events have accrued (handled natively by the GBM).
+    """
+    if len(abs_notional) == 0:
+        return np.zeros(0, dtype=np.float64)
+    s = pd.Series(abs_notional)
+    m = s.rolling(window, min_periods=min_periods).mean()
+    sd = s.rolling(window, min_periods=min_periods).std()
+    return ((s - m) / sd).to_numpy()
+
+
+def windowed_flow_sums(cs_signed: np.ndarray, cs_tot: np.ndarray, cs_cnt: np.ndarray,
+                       s0: int, n: int, query_ts: np.ndarray, window_s: int
+                       ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Windowed (net signed vol, total vol, count) over the ``window_s`` whole seconds
+    *strictly before* each query time, from contiguous-grid prefix sums.
+
+    Excluding the trade's own (partial) second avoids intra-second look-ahead. Returns
+    ``(net, tot, cnt, valid)``; ``valid`` is False where there is no in-grid history.
+    """
+    qsec = (np.asarray(query_ts) // US).astype(np.int64)
+    hi = qsec - s0                      # prefix index up to (not incl.) the current second
+    lo = hi - window_s
+    valid = (lo >= 0) & (hi <= n)
+    hi_c = np.clip(hi, 0, n); lo_c = np.clip(lo, 0, n)
+    net = cs_signed[hi_c] - cs_signed[lo_c]
+    tot = cs_tot[hi_c] - cs_tot[lo_c]
+    cnt = cs_cnt[hi_c] - cs_cnt[lo_c]
+    return net, tot, cnt, valid
+
+
 def seconds_since_last(event_ts: np.ndarray, query_ts: np.ndarray,
                        default: float = np.nan) -> np.ndarray:
     """Seconds since the most recent event at-or-before each query time.
@@ -157,6 +207,22 @@ def is_weekend(ts: np.ndarray) -> np.ndarray:
     return (dow >= 5).astype(np.float64)
 
 
+FUNDING_PERIOD_S: int = 8 * 3600          # Binance USDT-perp funds every 8h: 00/08/16 UTC
+
+
+def minutes_to_funding(ts: np.ndarray) -> np.ndarray:
+    """Minutes until the next 8-hour funding mark (00:00/08:00/16:00 UTC), in [0, 480)."""
+    sec_in = (ts // US) % FUNDING_PERIOD_S
+    return ((FUNDING_PERIOD_S - sec_in) % FUNDING_PERIOD_S).astype(np.float64) / 60.0
+
+
+def in_funding_window(ts: np.ndarray, margin_min: float = 5.0) -> np.ndarray:
+    """1.0 within ``margin_min`` of a funding mark (just before or just after)."""
+    m = minutes_to_funding(ts)
+    period_min = FUNDING_PERIOD_S / 60.0
+    return ((m <= margin_min) | (m >= period_min - margin_min)).astype(np.float64)
+
+
 # ---------------------------------------------------------------------------
 # 1-second mid grid for realized volatility / amplitude
 # ---------------------------------------------------------------------------
@@ -185,6 +251,26 @@ def _grid_vol_range(mid_grid: np.ndarray, windows_s: tuple[int, ...]
     return vol, ampl
 
 
+def _grid_regime(mid_grid: np.ndarray, skew_windows_s: tuple[int, ...] = (30, 300),
+                 vr_window_s: int = 300, vr_k: int = 10) -> dict[str, np.ndarray]:
+    """Regime descriptors on the 1s mid grid: rolling realized skew of 1s log-returns,
+    and a variance ratio (Var(k-step ret) / (k · Var(1-step ret)) — <1 mean-reverting,
+    >1 trending). All rolling, computed once; looked up per trade like vol/amplitude."""
+    s = pd.Series(mid_grid)
+    ret1 = np.log(s).diff()
+    out: dict[str, np.ndarray] = {}
+    for w in skew_windows_s:
+        out[f"rskew_{w}"] = ret1.rolling(w).skew().to_numpy()
+    retk = np.log(s).diff(vr_k)
+    var1 = ret1.rolling(vr_window_s).var().to_numpy()
+    vark = retk.rolling(vr_window_s).var().to_numpy()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        vr = vark / (vr_k * var1)
+    vr[~np.isfinite(vr)] = np.nan
+    out[f"varratio_{vr_window_s}"] = vr
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Feature context (built once; reused across trade batches)
 # ---------------------------------------------------------------------------
@@ -196,14 +282,34 @@ class FeatureContext:
     grid_vol: dict[int, np.ndarray]
     grid_ampl: dict[int, np.ndarray]
     change_ts: np.ndarray   # timestamps where the mid changed (for book "age")
+    grid_regime: dict[str, np.ndarray]              # rolling skew / variance ratio on the mid grid
+    liq_runlen: dict[str, np.ndarray]               # per-venue signed cascade run-length, aligned to liq.ts
+    liq_z: dict[str, np.ndarray]                    # per-venue cascade |notional| z-score, aligned to liq.ts
+    flow: "io.FlowGrid | None" = None               # 1s trade-flow grid (None ⇒ flow features are NaN)
+    flow_cs_signed: np.ndarray | None = None        # prefix sums for windowed flow lookups
+    flow_cs_tot: np.ndarray | None = None
+    flow_cs_cnt: np.ndarray | None = None
 
 
-def build_context(book: BookTop, liq_binance: Liquidations, liq_bybit: Liquidations) -> FeatureContext:
+def build_context(book: BookTop, liq_binance: Liquidations, liq_bybit: Liquidations,
+                  flow: "io.FlowGrid | None" = None) -> FeatureContext:
     s0, mid_grid = _second_grid(book)
     vol, ampl = _grid_vol_range(mid_grid, REALIZED_WINDOWS_S)
+    regime = _grid_regime(mid_grid)
     change_ts = book.ts[1:][np.diff(book.mid) != 0]
-    return FeatureContext(book, {"binance": liq_binance, "bybit": liq_bybit},
-                          s0, vol, ampl, change_ts)
+
+    liq = {"binance": liq_binance, "bybit": liq_bybit}
+    runlen = {e: liq_run_length(liq[e].side) for e in liq}
+    zsc = {e: liq_zscore(np.abs(liq[e].signed_notional)) for e in liq}
+
+    cs_s = cs_t = cs_c = None
+    if flow is not None:
+        cs_s = np.concatenate([[0.0], np.cumsum(flow.signed_vol)])
+        cs_t = np.concatenate([[0.0], np.cumsum(flow.tot_vol)])
+        cs_c = np.concatenate([[0.0], np.cumsum(flow.cnt)])
+
+    return FeatureContext(book, liq, s0, vol, ampl, change_ts, regime, runlen, zsc,
+                          flow, cs_s, cs_t, cs_c)
 
 
 def compute_features(ctx: FeatureContext, trade_ts: np.ndarray, sign: np.ndarray,
@@ -234,6 +340,17 @@ def compute_features(ctx: FeatureContext, trade_ts: np.ndarray, sign: np.ndarray
         feats[f"rv_{w}s"] = rv
         feats[f"ampl_{w}s"] = am
 
+    # --- regime descriptors: vol term-structure + grid skew / variance ratio
+    with np.errstate(divide="ignore", invalid="ignore"):
+        vtr = feats["rv_5s"] / feats["rv_300s"]
+        vtrm = feats["rv_30s"] / feats["rv_300s"]
+    vtr[~np.isfinite(vtr)] = np.nan; vtrm[~np.isfinite(vtrm)] = np.nan
+    feats["vol_ts_ratio"] = vtr          # short/long realized-vol ratio (term structure)
+    feats["vol_ts_ratio_mid"] = vtrm
+    for k, arr in ctx.grid_regime.items():
+        v = arr[gi].copy(); v[before_grid] = np.nan
+        feats[k] = v                     # rskew_30, rskew_300, varratio_300
+
     # --- top-of-book dynamics
     feats["book_age_s"] = seconds_since_last(ctx.change_ts, trade_ts)
     hi = np.searchsorted(ctx.change_ts, trade_ts, side="right")
@@ -253,12 +370,43 @@ def compute_features(ctx: FeatureContext, trade_ts: np.ndarray, sign: np.ndarray
         # cascade acceleration: is the burst speeding up (30s vs 300s rate)?
         feats[f"{exch}_liqaccel"] = cascade_acceleration(
             feats[f"{exch}_liqcnt_30s"], feats[f"{exch}_liqcnt_300s"], 30.0, 300.0)
+        # deeper cascade dynamics: signed run-length + cascade-size z (last event ≤ t)
+        idxl = np.searchsorted(liq.ts, trade_ts, side="right") - 1
+        okl = idxl >= 0
+        rl = np.full(len(trade_ts), np.nan); rl[okl] = ctx.liq_runlen[exch][idxl[okl]]
+        feats[f"{exch}_liq_runlen"] = rl
+        zz = np.full(len(trade_ts), np.nan); zz[okl] = ctx.liq_z[exch][idxl[okl]]
+        feats[f"{exch}_liqz"] = zz
 
     # --- cross-exchange liquidation divergence (Bybit leads Binance — core thesis)
     for w in (30, 300):
         div = feats[f"bybit_liqpress_{w}s"] - feats[f"binance_liqpress_{w}s"]
         feats[f"xexch_liqpress_{w}s"] = div
         feats[f"xexch_liqalign_{w}s"] = sign * div   # taker aligned with the Bybit-vs-Binance gap
+    # Bybit→Binance lead-lag: >0 ⇒ the Bybit liq is more recent (Bybit leads)
+    feats["liq_lead_s"] = feats["dt_last_binance_liq_s"] - feats["dt_last_bybit_liq_s"]
+
+    # --- tape-derived flow features (1s trade-flow grid; prefix-sum windows)
+    nrow = len(trade_ts)
+    for w in FLOW_WINDOWS_S:
+        if ctx.flow is None:
+            net = tot = cnt = np.zeros(nrow); valid = np.zeros(nrow, dtype=bool)
+        else:
+            net, tot, cnt, valid = windowed_flow_sums(
+                ctx.flow_cs_signed, ctx.flow_cs_tot, ctx.flow_cs_cnt,
+                ctx.flow.s0, ctx.flow.n, trade_ts, w)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            tfi = np.where(tot > 0, net / tot, 0.0)
+            mag = np.where(tot > 0, np.abs(net) / tot, 0.0)
+        intens = cnt / w
+        svm = sign * net
+        for arr in (tfi, mag, intens, svm):
+            arr[~valid] = np.nan
+        feats[f"tfi_{w}s"] = tfi
+        feats[f"tfi_aligned_{w}s"] = sign * tfi          # taker aligned with the flow imbalance
+        feats[f"trade_intensity_{w}s"] = intens          # trades/sec (regime)
+        feats[f"flow_imbalance_mag_{w}s"] = mag          # |imbalance| (VPIN-lite toxicity)
+        feats[f"signed_vol_mom_{w}s"] = svm              # taker-aligned signed volume
 
     # --- cross-exchange basis proxy + seasonality
     basis = basis_proxy_bps(ctx.liq["bybit"], trade_ts, mid_pre)
@@ -266,6 +414,8 @@ def compute_features(ctx: FeatureContext, trade_ts: np.ndarray, sign: np.ndarray
     feats["basis_signed_bps"] = sign * basis
     feats["hour"] = hour_of_day(trade_ts)
     feats["is_weekend"] = is_weekend(trade_ts)
+    feats["min_to_funding"] = minutes_to_funding(trade_ts)
+    feats["in_funding_window"] = in_funding_window(trade_ts)
     return feats
 
 
@@ -288,7 +438,8 @@ def build_feature_panel(symbol: str, *, target_rows: int = 3_000_000,
 
     book = io.load_book_top(symbol)
     ctx = build_context(book, io.load_liquidations("binance", symbol),
-                        io.load_liquidations("bybit", symbol))
+                        io.load_liquidations("bybit", symbol),
+                        flow=io.load_flow_grid(symbol))
     sample, step = io.sample_trades(symbol, target_rows)
 
     t = sample["timestamp"].to_numpy()

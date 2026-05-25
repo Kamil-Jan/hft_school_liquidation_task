@@ -1,11 +1,11 @@
-"""Combined predicted-markout model: one regressor per horizon.
+"""Predicted-markout model: one regressor per (symbol, horizon).
 
 A ``HistGradientBoostingRegressor`` predicts the maker markout ``pnl_i(tau)`` (bps)
 from the engineered features, trained with **sample weights** ``w_i`` (the spec's
 clipped notional) so the fit targets the same PnL the score optimises — per the
-task's weighted-classification hint and paper 1's PnL-not-accuracy lesson. Models
-are pooled across symbols (features are scale-free / venue-agnostic) and persisted
-per tau so the submission can load them.
+task's weighted-classification hint and paper 1's PnL-not-accuracy lesson. A model
+is fit per ``(symbol, tau)`` and persisted as ``model_<sym>_<tau>.joblib`` so the
+submission can load the one matching the symbol it is scoring.
 
 The predicted markout is a *signed* score: positive ⇒ expected-profitable maker
 trade. The keep/filter decision (expected-value or Score-maximising cutoff) lives
@@ -22,8 +22,6 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 
 from . import config
 from .features import feature_columns
-
-MODEL_PATH = config.ARTIFACTS_DIR / "model_{tau}.joblib"
 
 
 def _matrix(panel: pl.DataFrame, features: list[str]) -> np.ndarray:
@@ -66,34 +64,39 @@ def predict_from_features(model: HistGradientBoostingRegressor, feats: dict[str,
     return model.predict(X)
 
 
-def save(model: HistGradientBoostingRegressor, features: list[str], tau: int,
+def model_path(tau: int, symbol: str) -> Path:
+    """Artifact path for the per-symbol model ``model_<sym>_<tau>.joblib``."""
+    return config.ARTIFACTS_DIR / f"model_{symbol}_{tau}.joblib"
+
+
+def save(model: HistGradientBoostingRegressor, features: list[str], tau: int, symbol: str,
          *, threshold: float | None = None) -> Path:
-    """Persist a fitted model, its feature columns, and (optionally) the fitted
-    Score-maximising keep/filter ``threshold`` so the submission applies the same
-    operating point that the report measured."""
+    """Persist a fitted per-(symbol, tau) model, its feature columns, and (optionally)
+    the fitted Score-maximising keep/filter ``threshold`` so the submission applies the
+    same operating point that the report measured."""
     config.ensure_artifacts()
-    path = Path(str(MODEL_PATH).format(tau=tau))
+    path = model_path(tau, symbol)
     joblib.dump({"model": model, "features": features, "tau": tau,
-                 "threshold": threshold}, path)
+                 "symbol": symbol, "threshold": threshold}, path)
     return path
 
 
-def load(tau: int):
-    """Return ``(model, features)`` for a horizon, or ``(None, None)`` if absent."""
-    path = Path(str(MODEL_PATH).format(tau=tau))
+def load(tau: int, symbol: str):
+    """Return ``(model, features)`` for a (symbol, horizon), or ``(None, None)`` if absent."""
+    path = model_path(tau, symbol)
     if not path.exists():
         return None, None
     blob = joblib.load(path)
     return blob["model"], blob["features"]
 
 
-def load_threshold(tau: int) -> float | None:
-    """Return the persisted Score-maximising threshold for a horizon.
+def load_threshold(tau: int, symbol: str) -> float | None:
+    """Return the persisted Score-maximising threshold for a (symbol, horizon).
 
     ``None`` if no model is saved, or the model predates threshold persistence —
     callers then fall back to the expected-value cutoff.
     """
-    path = Path(str(MODEL_PATH).format(tau=tau))
+    path = model_path(tau, symbol)
     if not path.exists():
         return None
     return joblib.load(path).get("threshold")

@@ -3,8 +3,8 @@
 Research code for the task in [`description.md`](description.md): filter Binance
 maker trades using trade / BBO / liquidation data (Binance + Bybit) so that the
 *kept* trades have a better markout than the unfiltered baseline, subject to a
-$500k/day kept-turnover floor. Universe: `perp:btcusdt`, `perp:ethusdt`; 90 days
-(2025-12-01 → 2026-02-28 UTC).
+$500k/day kept-turnover floor. Universe: `perp:btcusdt`, `perp:ethusdt`; 179 days
+(2025-11-01 → 2026-04-28 UTC).
 
 ## Layout
 
@@ -43,19 +43,29 @@ building and the chunked submission path); scripts/notebooks only orchestrate.
 ## Data — where to put it
 
 The loaders read parquet from a data directory (default `data/`, resolved by
-`config.dataset_path`). Place the **train** data in `data/` and any held-out **test**
-data in a parallel `data_test/` with the *same* internal layout — both are gitignored.
-File names are exact (note: Bybit liquidations have **no** `perp_` prefix):
+`config.dataset_path`). Put the full dataset in `data/`; the **train / validation /
+test split is carved by date inside the code** (see below), not by separate folders.
+A parallel `data_test/` is only needed if a reviewer scores an *external* held-out set
+with `make evaluate` (same layout). All data dirs are gitignored. File names are exact
+(note: Bybit liquidations have **no** `perp_` prefix):
 
 ```
-data/                                          <- TRAIN (the shipped 90 days)
+data/                                          <- the full dataset (2025-11-01 → 2026-04-28)
   binance_trades/        perp_btcusdt.parquet  perp_ethusdt.parquet
   binance_booktickers/   perp_btcusdt.parquet  perp_ethusdt.parquet
   binance_liquidations/  perp_btcusdt.parquet  perp_ethusdt.parquet
   bybit_liquidations/    btcusdt.parquet       ethusdt.parquet
-data_test/                                     <- TEST (same layout; reviewer-supplied)
+data_test/                                     <- optional external test set (same layout)
   binance_trades/ ...  binance_booktickers/ ...  binance_liquidations/ ...  bybit_liquidations/ ...
 ```
+
+**Train/validation/test split** lives in `config.py` (single source of truth in
+`splits.py`): edit four dates and the `USE_TEST` toggle. `USE_TEST=True` (default) gives
+a 3-way split — train `2025-11-01..2026-02-28`, validation `2026-03`, test `2026-04`;
+set `USE_TEST=False` for the final model and the April test window folds into validation.
+A `SPLIT_EMBARGO_S` (= max τ = 300 s) gap is purged before each boundary so no trade's
+markout window straddles two splits (leak-safe). After changing any of these, re-run
+`make panel && make train`.
 
 Schemas (timestamps are **int64 microseconds, UTC** throughout):
 

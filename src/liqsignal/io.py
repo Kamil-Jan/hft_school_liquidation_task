@@ -52,6 +52,24 @@ class Liquidations:
     signed_notional: np.ndarray  # float64
 
 
+@dataclass(frozen=True)
+class FlowGrid:
+    """Per-second trade-flow aggregates for one symbol, contiguous from ``s0``.
+
+    Index ``i`` is epoch second ``s0 + i``; seconds with no trades are zero-filled.
+    Windowed flow features are then prefix-sum lookups on these dense arrays (the
+    same trick as :func:`features.windowed_liq`, but on a contiguous grid).
+    """
+    s0: int                  # epoch second of index 0
+    signed_vol: np.ndarray   # float64 net signed volume (buy − sell amount) per second
+    tot_vol: np.ndarray      # float64 total traded amount per second
+    cnt: np.ndarray          # float64 trade count per second
+
+    @property
+    def n(self) -> int:
+        return len(self.signed_vol)
+
+
 # ---------------------------------------------------------------------------
 # Lazy scans (for streaming aggregations)
 # ---------------------------------------------------------------------------
@@ -104,14 +122,55 @@ def liquidations_from_frame(df: pl.DataFrame, exchange: str, *, shift_bybit: boo
                         signed_notional=signed_notional[order])
 
 
+def _flow_grid_from_seconds(sec: np.ndarray, signed_vol: np.ndarray,
+                            tot_vol: np.ndarray, cnt: np.ndarray) -> FlowGrid:
+    """Build a contiguous :class:`FlowGrid` from sparse per-second aggregates."""
+    sec = np.asarray(sec, dtype=np.int64)
+    s0, s1 = int(sec[0]), int(sec[-1])
+    n = s1 - s0 + 1
+    sv = np.zeros(n, dtype=np.float64); tv = np.zeros(n, dtype=np.float64); ct = np.zeros(n, dtype=np.float64)
+    idx = sec - s0
+    sv[idx] = signed_vol; tv[idx] = tot_vol; ct[idx] = cnt
+    return FlowGrid(s0=s0, signed_vol=sv, tot_vol=tv, cnt=ct)
+
+
+def flow_grid_from_trades(ts_us: np.ndarray, is_buy: np.ndarray, amount: np.ndarray) -> FlowGrid:
+    """Build a :class:`FlowGrid` in memory from trade arrays (the submission path)."""
+    sec = (np.asarray(ts_us) // config.US).astype(np.int64)
+    amt = np.asarray(amount, dtype=np.float64)
+    sv = np.where(np.asarray(is_buy), 1.0, -1.0) * amt
+    g = (pl.DataFrame({"sec": sec, "sv": sv, "amt": amt})
+         .group_by("sec").agg(signed_vol=pl.col("sv").sum(), tot_vol=pl.col("amt").sum(), cnt=pl.len())
+         .sort("sec"))
+    return _flow_grid_from_seconds(g["sec"].to_numpy(), g["signed_vol"].to_numpy(),
+                                   g["tot_vol"].to_numpy(), g["cnt"].to_numpy())
+
+
 # ---------------------------------------------------------------------------
 # Materialised loaders (read a symbol's full file, then delegate to the above)
 # ---------------------------------------------------------------------------
 def load_book_top(symbol: str) -> BookTop:
-    """Load the full BBO feed for ``symbol`` as sorted arrays."""
-    return book_top_from_frame(pl.read_parquet(
-        config.dataset_path("bbo", symbol),
-        columns=["timestamp", "bid_price", "ask_price", "bid_amount", "ask_amount"]))
+    """Load the full BBO feed for ``symbol`` as sorted arrays.
+
+    Computes mid/spread in a *streaming* select and downcasts the amounts so only
+    the compact output columns are materialised — peak memory is roughly half of
+    reading all five float64 columns whole, which matters once the feed passes
+    ~200 M rows.
+    """
+    df = (pl.scan_parquet(config.dataset_path("bbo", symbol))
+          .select(
+              pl.col("timestamp"),
+              ((pl.col("bid_price") + pl.col("ask_price")) / 2.0).alias("mid"),
+              (pl.col("ask_price") - pl.col("bid_price")).cast(pl.Float32).alias("spread"),
+              pl.col("bid_amount").cast(pl.Float32),
+              pl.col("ask_amount").cast(pl.Float32))
+          .collect(engine="streaming"))
+    book = BookTop(ts=df["timestamp"].to_numpy(), mid=df["mid"].to_numpy(),
+                   spread=df["spread"].to_numpy(), bid_amount=df["bid_amount"].to_numpy(),
+                   ask_amount=df["ask_amount"].to_numpy())
+    if not np.all(np.diff(book.ts) >= 0):
+        raise ValueError("BBO frame is not sorted by timestamp")
+    return book
 
 
 def load_liquidations(exchange: str, symbol: str, *, shift_bybit: bool = True) -> Liquidations:
@@ -119,6 +178,16 @@ def load_liquidations(exchange: str, symbol: str, *, shift_bybit: bool = True) -
     d = pl.read_parquet(config.dataset_path(f"liq_{exchange}", symbol),
                         columns=["timestamp", "side", "price", "amount"])
     return liquidations_from_frame(d, exchange, shift_bybit=shift_bybit)
+
+
+def load_flow_grid(symbol: str) -> FlowGrid:
+    """Load the precomputed 1s trade-flow grid for ``symbol`` (built by `make flowgrid`)."""
+    path = config.ARTIFACTS_DIR / f"flow_grid_{symbol}.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} missing — run `make flowgrid` first")
+    g = pl.read_parquet(path).sort("sec")
+    return _flow_grid_from_seconds(g["sec"].to_numpy(), g["signed_vol"].to_numpy(),
+                                   g["tot_vol"].to_numpy(), g["cnt"].to_numpy())
 
 
 def sample_trades(symbol: str, target_rows: int) -> tuple[pl.DataFrame, int]:

@@ -4,9 +4,10 @@ import numpy as np
 from liqsignal import config
 from liqsignal.io import BookTop, Liquidations
 from liqsignal.features import (basis_proxy_bps, build_context, cascade_acceleration,
-                                compute_features, hour_of_day, is_weekend,
-                                microprice_adjustment_bps, order_book_imbalance,
-                                seconds_since_last, windowed_liq)
+                                compute_features, hour_of_day, in_funding_window, is_weekend,
+                                liq_run_length, microprice_adjustment_bps, minutes_to_funding,
+                                order_book_imbalance, seconds_since_last, windowed_flow_sums,
+                                windowed_liq)
 
 US = config.US
 
@@ -44,6 +45,40 @@ def test_cascade_acceleration():
     assert np.isnan(out[2])          # no long-window events -> missing
 
 
+def test_windowed_flow_sums():
+    s0 = 100
+    signed = np.array([2.0, -1.0, 3.0, 0.0, 5.0])
+    tot = np.array([2.0, 3.0, 3.0, 4.0, 5.0])
+    cnt = np.array([1.0, 2.0, 1.0, 2.0, 3.0])
+    cs_s = np.concatenate([[0.0], np.cumsum(signed)])
+    cs_t = np.concatenate([[0.0], np.cumsum(tot)])
+    cs_c = np.concatenate([[0.0], np.cumsum(cnt)])
+    n = len(signed)
+    # query at second s0+3, window 2s -> the two whole seconds strictly before it (idx 1,2)
+    q = np.array([(s0 + 3) * config.US + config.US // 2], dtype=np.int64)
+    net, t, c, valid = windowed_flow_sums(cs_s, cs_t, cs_c, s0, n, q, 2)
+    assert valid[0]
+    assert np.isclose(net[0], signed[1] + signed[2])   # -1 + 3 = 2
+    assert np.isclose(t[0], tot[1] + tot[2]) and np.isclose(c[0], cnt[1] + cnt[2])
+    # no in-grid history -> invalid
+    _, _, _, v0 = windowed_flow_sums(cs_s, cs_t, cs_c, s0, n, np.array([s0 * config.US]), 2)
+    assert not v0[0]
+
+
+def test_liq_run_length():
+    side = np.array(["buy", "buy", "sell", "buy", "buy", "buy"])
+    np.testing.assert_array_equal(liq_run_length(side), [1, 2, -1, 1, 2, 3])
+
+
+def test_funding_seasonality():
+    base = config._utc_us(2026, 1, 1)                  # 00:00 UTC is a funding mark
+    assert np.isclose(minutes_to_funding(np.array([base]))[0], 0.0)
+    assert in_funding_window(np.array([base]))[0] == 1.0
+    t2 = base + 2 * 3600 * config.US                   # 2h after a mark -> 360 min to next
+    assert np.isclose(minutes_to_funding(np.array([t2]))[0], 360.0)
+    assert in_funding_window(np.array([t2]))[0] == 0.0
+
+
 def test_seconds_since_last_nan_default():
     ev = np.array([100, 200], dtype=np.int64)
     out = seconds_since_last(ev, np.array([50, 250], dtype=np.int64))  # 50 before first
@@ -52,10 +87,11 @@ def test_seconds_since_last_nan_default():
 
 
 def test_hour_and_weekend():
-    # 2025-12-01 00:00:00 UTC was a Monday
-    assert hour_of_day(np.array([config.TRAIN_START]))[0] == 0
-    assert is_weekend(np.array([config.TRAIN_START]))[0] == 0.0          # Monday
-    assert is_weekend(np.array([config.TRAIN_START + 5 * config.DAY_US]))[0] == 1.0  # Saturday
+    monday = config._utc_us(2025, 12, 1)   # 2025-12-01 00:00:00 UTC is a Monday
+    assert hour_of_day(np.array([monday]))[0] == 0
+    assert hour_of_day(np.array([monday + 13 * 3600 * config.US]))[0] == 13
+    assert is_weekend(np.array([monday]))[0] == 0.0                       # Monday
+    assert is_weekend(np.array([monday + 5 * config.DAY_US]))[0] == 1.0   # Saturday
 
 
 def test_basis_proxy_recency_gate():
@@ -99,3 +135,10 @@ def test_compute_features_contract():
     # identical binance/bybit feeds in this fixture ⇒ zero cross-exchange divergence
     np.testing.assert_allclose(feats["xexch_liqpress_30s"], [0.0, 0.0], atol=1e-9)
     np.testing.assert_allclose(feats["xexch_liqpress_300s"], [0.0, 0.0], atol=1e-9)
+    # roadmap #1–4 features are present
+    assert {"tfi_30s", "tfi_aligned_300s", "trade_intensity_30s", "flow_imbalance_mag_300s",
+            "signed_vol_mom_30s", "liq_lead_s", "binance_liq_runlen", "bybit_liqz",
+            "rskew_30", "varratio_300", "vol_ts_ratio", "min_to_funding",
+            "in_funding_window"} <= set(feats)
+    # flow=None in this fixture ⇒ flow features are NaN
+    assert np.all(np.isnan(feats["tfi_30s"])) and np.all(np.isnan(feats["signed_vol_mom_300s"]))

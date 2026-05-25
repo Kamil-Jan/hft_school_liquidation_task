@@ -9,6 +9,7 @@ Timestamps are int64 **microseconds since the UNIX epoch (UTC)** throughout.
 """
 from __future__ import annotations
 
+import datetime as dt
 import os
 from pathlib import Path
 
@@ -70,9 +71,46 @@ NOTIONAL_CAP: float = 100_000.0                # weight w_i = min(notional_i, ca
 BYBIT_DELAY_US: int = 200_000                  # cross-exchange availability handicap
 TURNOVER_MIN_PER_DAY: float = 500_000.0        # kept-trade clipped turnover floor (USD/day)
 
-# Split boundaries (epoch microseconds, UTC), right edge exclusive.
-#   train      2025-12-01 .. 2026-01-31   (62 days)
-#   validation 2026-02-01 .. 2026-02-28   (28 days)
-TRAIN_START: int = 1_764_547_200_000_000       # 2025-12-01 00:00:00 UTC
-VAL_START: int = TRAIN_START + 62 * DAY_US      # 2026-02-01 00:00:00 UTC
-VAL_END: int = TRAIN_START + 90 * DAY_US        # 2026-03-01 00:00:00 UTC (exclusive)
+# Feature pruning: keep the top-N features (by permutation importance on validation)
+# per horizon, refitting on them. None ⇒ keep all. Override at train time with
+# `make train N_FEATURES=30` / `train_model.py --n-features 30`.
+N_FEATURES: int | None = None
+
+# Curated per-(symbol, τ) feature sets. Used by `train_model` per model when non-empty
+# (precedence: --n-features > FEATURE_SETS > all features). **Currently empty ⇒ all
+# features.** A first cut (notebook 02 / `scripts/select_features.py`, redundancy-filtered
+# then top-N by *validation* importance) was reverted: ranking on validation overfit it and
+# **hurt the held-out test** (see .claude/docs/features.md). Re-derive leak-free (rank on a train-internal
+# fold, val/test untouched) before populating this. The script is kept for that redo.
+FEATURE_SETS: dict[tuple[str, int], list[str]] = {}
+
+# ---------------------------------------------------------------------------
+# Train / validation / test split
+# ---------------------------------------------------------------------------
+# To re-time the splits, edit the four dates below — that is the only place. All
+# boundaries are UTC midnight, **right edge exclusive**. Data currently spans
+# 2025-11-01 .. 2026-04-28 (inclusive).
+#
+#   USE_TEST = True   → 3-way: train | validation | test
+#       train [TRAIN_START, VAL_START)  validation [VAL_START, TEST_START)  test [TEST_START, SPLIT_END)
+#   USE_TEST = False  → 2-way: the April test window folds into validation
+#       train [TRAIN_START, VAL_START)  validation [VAL_START, SPLIT_END)
+#
+# Leak safety: SPLIT_EMBARGO_S seconds are purged before each split boundary so no
+# trade's markout window (≤ max τ) can straddle two splits — see splits.py.
+
+def _utc_us(year: int, month: int, day: int) -> int:
+    """Epoch microseconds at 00:00:00 UTC on the given date."""
+    return int(dt.datetime(year, month, day, tzinfo=dt.timezone.utc).timestamp()) * US
+
+
+USE_TEST: bool = True
+SPLIT_EMBARGO_S: int = max(TAUS)               # = 300 s; gap purged before each boundary
+
+TRAIN_START: int = _utc_us(2025, 11, 1)        # start of train (first day of data)
+VAL_START:   int = _utc_us(2026, 3, 1)         # train → validation
+TEST_START:  int = _utc_us(2026, 4, 1)         # validation → test (only if USE_TEST)
+SPLIT_END:   int = _utc_us(2026, 4, 29)        # end of data, exclusive (2026-04-28 inclusive)
+
+# Derived (do not edit): right edge of the validation window.
+VAL_END: int = TEST_START if USE_TEST else SPLIT_END

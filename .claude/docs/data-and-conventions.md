@@ -1,12 +1,12 @@
 # Data & conventions
 
-## The four datasets (per symbol: `btc`, `eth`; 90 days 2025-12-01 → 2026-02-28 UTC)
+## The four datasets (per symbol: `btc`, `eth`; 179 days 2025-11-01 → 2026-04-28 UTC)
 | source (`config` key) | file | columns | rows (BTC / ETH) |
 |---|---|---|---|
-| `trades` | `data/binance_trades/perp_<sym>usdt.parquet` | timestamp, ticker, side, price, amount | 402M / 706M |
-| `bbo` | `data/binance_booktickers/perp_<sym>usdt.parquet` | timestamp, ticker, bid_price, bid_amount, ask_price, ask_amount | 99M / 108M |
-| `liq_binance` | `data/binance_liquidations/perp_<sym>usdt.parquet` | timestamp, ticker, side, price, amount | 114K / 132K |
-| `liq_bybit` | `data/bybit_liquidations/<sym>usdt.parquet` | timestamp, ticker, side, price, amount | 229K / 160K |
+| `trades` | `data/binance_trades/perp_<sym>usdt.parquet` | timestamp, ticker, side, price, amount | 804M / 1.37B |
+| `bbo` | `data/binance_booktickers/perp_<sym>usdt.parquet` | timestamp, ticker, bid_price, bid_amount, ask_price, ask_amount | 203M / 220M |
+| `liq_binance` | `data/binance_liquidations/perp_<sym>usdt.parquet` | timestamp, ticker, side, price, amount | 236K / 271K |
+| `liq_bybit` | `data/bybit_liquidations/<sym>usdt.parquet` | timestamp, ticker, side, price, amount | 438K / 302K |
 
 `ticker` is `perp:btcusdt`/`perp:ethusdt` (Binance) or `btcusdt`/`ethusdt` (Bybit).
 **BBO is top-of-book only** — no depth beyond level 1. No funding/OI data exists; any
@@ -20,8 +20,11 @@ feature must be computable from these four frames alone (the submission gets onl
 - **Filter** `f_i(τ) ∈ {0,1}`, 1 = filter out.
 - **Score** `= PnL_kept − PnL_all` (w-weighted means; maximise). Also report `PnL_filtered`.
 - **Constraint** `KeptTurnoverPerDay = Σ(1-f)·w / n_days ≥ 500_000`.
-- **Split:** train 2025-12-01..2026-01-31 (62 days), val 2026-02-01..2026-02-28 (28 days),
-  test hidden (other dates).
+- **Split (configurable in `config.py`, single source of truth in `splits.py`):** edit four
+  dates + the `USE_TEST` toggle. Current default (`USE_TEST=True`): train 2025-11-01..2026-02-28
+  (120 d), val 2026-03 (31 d), test 2026-04 (28 d). With `USE_TEST=False` the April test window
+  folds into validation (2-way). A `SPLIT_EMBARGO_S` (= max τ = 300 s) gap is purged before each
+  boundary so no trade's markout window straddles two splits (leak-safe).
 - **Submission:** `signal(trades, bbo, liq_binance, liq_bybit) -> {30,120,300: 0/1 array}`,
   each length `len(trades)`. Called per symbol.
 
@@ -40,6 +43,10 @@ feature must be computable from these four frames alone (the submission gets onl
    have thousands of same-µs collisions. **Always sort** before as-of joins (the loaders do).
 
 ## Data quality / quirks (notebook §2, §7)
+> ⚠️ The quality and distribution figures below were measured by the EDA on the **original
+> 90-day window** (2025-12-01 → 2026-02-28). The data folder now spans 179 days
+> (2025-11-01 → 2026-04-28); re-run `make eda` to refresh these on the full range.
+
 - **Clean where it counts:** zero crossed/locked books, zero/negative prices, zero
   zero-size trades, zero NaN prices across 207M BBO rows and 1.1B trades.
 - **BBO ~99.99% complete:** only 6 (BTC) / 9 (ETH) missing minutes in 90 days, on the

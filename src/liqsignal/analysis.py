@@ -92,42 +92,61 @@ def apply_threshold(score: np.ndarray, threshold: float) -> np.ndarray:
     return (np.asarray(score) < threshold).astype(np.int8)
 
 
-def fit_score_threshold(score: np.ndarray, pnl: np.ndarray, w: np.ndarray, day: np.ndarray,
+def fit_score_threshold(score: np.ndarray, pnl: np.ndarray, w: np.ndarray, ts: np.ndarray,
                         *, step: float = 1.0, turnover_floor: float = config.TURNOVER_MIN_PER_DAY,
-                        n_grid: int = 60, cv: int = 5, min_keep_frac: float = 0.0,
-                        seed: int = 0) -> tuple[float, float]:
-    """Choose the score cutoff that maximises Score = PnL_kept - PnL_all.
+                        n_grid: int = 60, n_splits: int = 5, embargo_s: int | None = None,
+                        min_keep_frac: float = 0.0) -> tuple[float, float]:
+    """Choose the score cutoff that maximises Score = PnL_kept - PnL_all, via
+    **purged + embargoed time-series CV**.
 
-    Candidate cutoffs are quantiles of ``score``. Each is evaluated by k-fold CV
-    (mean held-out Score) to curb overfitting, keeping only cutoffs that respect
-    the turnover floor and an optional ``min_keep_frac`` guard against degenerate
-    over-selection. Returns ``(threshold, cv_score)``.
+    Candidate cutoffs are quantiles of ``score``. Rows are sorted by ``ts`` (epoch
+    µs) and split into ``n_splits`` *contiguous time blocks*; each candidate is
+    scored on every held-out block with an ``embargo_s``-second margin purged at the
+    internal boundaries, so a trade whose markout window (≤ max τ) reaches into the
+    neighbouring block can't inflate the estimate. The cutoff with the best mean
+    held-out Score (subject to the turnover floor and an optional ``min_keep_frac``
+    guard on every block) is returned as ``(threshold, cv_score)``.
 
-    All inputs are aligned 1-D arrays over a *single* split (fit on train; apply
-    the returned threshold to validation with :func:`apply_threshold`).
+    Random k-fold would mix adjacent, overlapping-markout trades across folds and
+    badly overstate the Score; contiguous purged folds give an honest estimate.
+    Fit on train; apply the returned threshold to validation/test via
+    :func:`apply_threshold`.
     """
     score = np.asarray(score, dtype=np.float64)
     pnl = np.asarray(pnl, dtype=np.float64)
     w = np.asarray(w, dtype=np.float64)
-    day = np.asarray(day)
+    ts = np.asarray(ts)
     valid = np.isfinite(score) & np.isfinite(pnl) & np.isfinite(w)
-    score, pnl, w, day = score[valid], pnl[valid], w[valid], day[valid]
+    score, pnl, w, ts = score[valid], pnl[valid], w[valid], ts[valid]
+    if len(score) == 0:
+        return 0.0, float("nan")
+
+    embargo_us = (max(config.TAUS) if embargo_s is None else embargo_s) * config.US
+    order = np.argsort(ts, kind="stable")
+    score, pnl, w, ts = score[order], pnl[order], w[order], ts[order]
+    bounds = np.linspace(0, len(score), n_splits + 1).astype(int)
 
     candidates = np.unique(np.quantile(score, np.linspace(0.0, 0.99, n_grid)))
-    rng = np.random.default_rng(seed)
-    folds = rng.integers(0, cv, size=len(score))
-
     best_thr, best_cv = float(candidates[0]), -np.inf
     for thr in candidates:
         fold_scores = []
         ok = True
-        for k in range(cv):
-            m = folds == k
-            if not m.any():
+        for k in range(n_splits):
+            a, b = int(bounds[k]), int(bounds[k + 1])
+            if b <= a:
                 continue
-            f = apply_threshold(score[m], thr)
-            n_days = max(1, len(np.unique(day[m])))
-            res = evaluate_filter(pnl[m], w[m], f, n_days=n_days, turnover_scale=step)
+            tt = ts[a:b]
+            keep = np.ones(b - a, dtype=bool)
+            if k > 0:                       # purge rows abutting the previous block
+                keep &= (tt - tt[0]) >= embargo_us
+            if k < n_splits - 1:            # purge rows whose markout reaches into the next block
+                keep &= (tt[-1] - tt) >= embargo_us
+            if not keep.any():
+                continue
+            sc, pn, ww, tk = score[a:b][keep], pnl[a:b][keep], w[a:b][keep], tt[keep]
+            f = apply_threshold(sc, thr)
+            n_days = max(1, len(np.unique(tk // config.DAY_US)))
+            res = evaluate_filter(pn, ww, f, n_days=n_days, turnover_scale=step)
             if res.kept_turnover_per_day < turnover_floor or (1.0 - res.frac_filtered_n) < min_keep_frac:
                 ok = False
                 break
