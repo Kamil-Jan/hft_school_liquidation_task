@@ -22,9 +22,10 @@
 | `scoring.py` | Score + turnover | `evaluate_filter(pnl,w,f,n_days,turnover_scale) -> ScoreResult`, `weighted_mean` |
 | `features.py` | feature engineering | pure fns (`order_book_imbalance`, `microprice_adjustment_bps`, `windowed_liq`, `basis_proxy_bps`, …); `FeatureContext` + `build_context`; `compute_features(ctx,ts,sign,price) -> dict`; `feature_columns`; `build_feature_panel(sym)` |
 | `analysis.py` | studies + thresholding | `conditional_markout`, `fit_keep_best`/`apply_keep_best` (old single-feature rule), `expected_value_threshold`, `fit_score_threshold` (CV Score-max), `apply_threshold`, `score_split` |
-| `model.py` | per-τ predictor | `train_markout_model(panel,tau)` (HistGBR, `sample_weight=w`), `predict_markout`, `predict_from_features`, `save`/`load` |
+| `model.py` | per-(sym,τ) predictor | `fit_model(panel,tau,symbol)` dispatches `config.MODEL_SPECS` → HistGBR (`train_markout_model`, optional `loss`/`recency_weight`) or `fit_lgbm_quantile`; `predict_markout`, `predict_from_features` (uniform `.predict`), `save`(+`kind`)/`load`/`load_threshold` |
+| `backtest.py` | walk-forward OOS judge | `run_walk_forward(panel,step,tau,fit_fn)`, `evaluate_specs`/`summarize`; `fit_fn` factories (hgbr/recency/monotonic/clf/lgbm/shipped) + `SPEC_SETS` |
 | `baselines.py` | full-data references | `compute_baselines()` → PnL_all + turnover/day per (sym,split,tau) |
-| `report.py` | results report | `generate(panels,steps,models,features,thresholds)` → `artifacts/report/` |
+| `report.py` | results report | `generate(panels,steps,models,features,thresholds)` → `artifacts/report/`; `regime_by_month`, walk-forward + spec sections |
 | `signal.py` | **submission entry point** | `signal(trades,bbo,liq_binance,liq_bybit, *, filter_fn=None, thresholds=None, cost=0.0)` |
 
 ## Data flow
@@ -38,7 +39,7 @@ BookTop, Liquidations (sorted numpy arrays)        sample_trades / iter_trade_ba
                                                                                     ▼
                        markout.compute_markout (label) ───────────► panel (polars DF)
                                                                                     │
-                                          model.train_markout_model (per τ, w-weighted)
+                                          model.fit_model (per (sym,τ) estimator spec, w-weighted)
                                                                                     │
                                           score = model.predict ; analysis.fit_score_threshold
                                                                                     ▼
@@ -46,13 +47,17 @@ BookTop, Liquidations (sorted numpy arrays)        sample_trades / iter_trade_ba
 ```
 
 ## The submission path (`signal._model_signal`)
-1. Load per-τ models from `artifacts/model_<tau>.joblib` (keep-all fallback + warning if absent).
+1. Infer the symbol (`ticker` col or price level) and load its per-τ models from
+   `artifacts/model_<sym>_<tau>.joblib` (keep-all fallback + warning if absent). A model may
+   be HistGBR or LightGBM — `predict_from_features` calls `.predict` either way (loading a
+   LightGBM blob requires `lightgbm` importable; see README/`patch_lightgbm.py`).
 2. Build one `FeatureContext` from the passed frames (`io.book_top_from_frame`,
-   `io.liquidations_from_frame`). The context precomputes the 1-second mid grid
-   (rolling vol/amplitude) and mid-change timestamps once.
-3. Iterate trades in `BATCH = 20M` chunks: `compute_features` → `model.predict` per τ →
-   threshold (expected-value `score<cost`, or supplied `thresholds[tau]`) → fill the 0/1 output.
-   Memory stays bounded (output is 1 byte/trade; feature matrix is per-batch).
+   `io.liquidations_from_frame`, `io.flow_grid_from_trades`). The context precomputes the
+   1-second mid grid (rolling vol/amplitude/regime), the flow grid, and mid-change timestamps once.
+3. Iterate trades in `BATCH = 5M` chunks: `compute_features` → `model.predict_from_features` per τ →
+   threshold (each model's persisted Score-max cutoff, or supplied `thresholds[tau]`, else
+   expected-value `score<cost`) → fill the 0/1 output. Memory stays bounded (output is 1 byte/trade;
+   feature matrix is per-batch).
 
 ## How to extend
 - **Add a feature:** write a pure fn in `features.py`, add it inside `compute_features`
@@ -62,7 +67,10 @@ BookTop, Liquidations (sorted numpy arrays)        sample_trades / iter_trade_ba
 - **Tape-derived features (TFI/VPIN/intensity)** need a streamed **1s trade-flow grid**
   (the 700M-row tape can't be held in RAM) — see roadmap; build it like the EDA
   aggregates and join by prefix-sum + `searchsorted`.
-- **Change the model/threshold:** swap the estimator in `model.train_markout_model`;
-  thresholding lives in `analysis`. Submission wiring in `signal.py` is unchanged.
-- **Pooling:** models are pooled across symbols (features are scale-free); one model per
-  τ, applied regardless of symbol at submission time.
+- **Change the model/threshold:** add a `fit_fn` spec in `backtest.py`, judge it with
+  `make walkforward --specs ...`, then if it wins set `config.MODEL_SPECS[(sym,τ)]` and teach
+  `model.fit_model` the new `kind`. Thresholding lives in `analysis`. Submission wiring in
+  `signal.py` is unchanged as long as the estimator exposes `.predict` (higher ⇒ keep).
+- **Per-(symbol, τ) models:** one model per `(symbol, τ)` (`model_<sym>_<tau>.joblib`),
+  each with its own estimator (`config.MODEL_SPECS`) and persisted threshold; `signal()`
+  infers the symbol and loads the matching pair. (The old pooled-across-symbols model is gone.)

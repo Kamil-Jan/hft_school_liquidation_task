@@ -21,7 +21,11 @@ dependencies = [
 
 [project.optional-dependencies]
 notebook = ["jupyter==1.1.1", "notebook==7.5.6", "ipykernel==6.31.0"]
-dev = ["pytest==8.3.4"]
+# lightgbm powers the experiment-only objective-reframing specs (quantile / ranking) in
+# the walk-forward harness; the shipped signal() depends on it only if such a spec wins.
+# On macOS its wheel needs an OpenMP runtime (libomp) — `make install` runs
+# scripts/patch_lightgbm.py to point it at scikit-learn's vendored copy (no homebrew).
+dev = ["pytest==8.3.4", "lightgbm==4.6.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

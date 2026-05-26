@@ -41,7 +41,7 @@
   the pooled path was removed. `signal()` infers the symbol (ticker/price) and loads the matching
   model. Lifted BTC validation (val τ120/300 +0.64/+0.48 vs pooled +0.20/+0.03) and test. The
   symbol×τ feature-importance grid shows BTC vs ETH rank features differently.
-- **Feature-selection study** — `notebooks/02_feature_selection.ipynb` (`make feature-selection`):
+- **Feature-selection study** — `notebooks/02_feature_selection.ipynb` (`make feature-nb`):
   missingness, univariate corr/MI, correlation clustering, train→val importance stability, PCA, and
   a top-N validation-Score sweep. Findings (see `features.md`): weak univariate signal (max
   |corr|≈0.17, led by `*_liqalign`/`signed_vol_mom`/`ret_*_signed`), several redundant blocks, PCA
@@ -54,21 +54,37 @@
   validation but degraded the held-out test** (ETH τ300 test 6.00→2.18) — a val-selection leak.
   Reverted to all features (`FEATURE_SETS={}`); the script is kept. See `features.md`.
 
+## Done (2026-05-26 — model-improvement cycle)
+- **Walk-forward OOS harness** (`src/liqsignal/backtest.py`, `make walkforward`) — expanding-window
+  backtest judging any model spec on three held-out months (Feb/Mar/Apr); reproduces the shipped
+  validation Scores on the matching fold. Plus a per-month regime diagnostic (`make regime`).
+- **Regime sign-flip characterised** — the liquidation edge flips sign in Dec (both) and March (ETH);
+  that, not features/threshold, is the source of ETH's negative validation.
+- **Objective reframed (#4) + ETH regime fixed (#5)** — per-`(symbol, τ)` estimators in
+  `config.MODEL_SPECS` / `model.fit_model`: HGBR **MAE** (robust, beats MSE broadly), HGBR **recency**
+  weights (BTC τ300), and **LightGBM quantile** for ETH τ120/300 (turns the −7.06 March blow-up to
+  +0.26). Judged on mean OOS Score; the submission `predict` path stays uniform.
+- **Monotonic constraints (#3)** — tested in the harness; helped ETH means but hurt BTC variance, so
+  **not adopted** (left available as a `backtest` spec).
+- **Leak-free feature selection — derived, judged, decided** — `scripts/select_features.py` ranks
+  importance on a train-internal fit/selection split (RANKER = MSE-HGBR), picks N by a train-internal
+  sweep + knee scored with the *deployed* estimator (JUDGE), and emits `feature_selection_sweep` +
+  `feature_importance_rank` parquets. The `features` walk-forward spec is now shipped-all vs
+  shipped-curated. **Verdict: all-73 won 5/6 cells on mean OOS (only ETH τ30 marginally passed);
+  `FEATURE_SETS` stays `{}`.** Why-they-help analysis in `scripts/analyze_feature_sets.py`
+  (`make feature-explain`) + notebook §8 + features.md: the edge is spread across many
+  consistent-sign features, so pruning loses signal without a variance payoff.
+
 ## Next (highest value first)
 
 ### Modeling / robustness
-1. **Leak-free feature selection** — re-derive `FEATURE_SETS` ranking importance on a
-   *train-internal* fold (split train into fit/selection), leaving val **and** test untouched,
-   then confirm on test. The current `scripts/select_features.py` ranks on validation, which
-   overfit it; wire it through `train_model` (precedence already supports `FEATURE_SETS`).
-2. **Probability calibration** — isotonic/Platt on a held-out fold so the score reads as a
-   probability and the expected-value cutoff is principled; compare to score-max.
-3. **Monotonic constraints** in HistGBR for sign-known features (e.g. `*_liqalign`,
-   `xexch_liqalign`, `tfi_aligned`) — cheaper variance, more robust out-of-regime.
-4. **Reframe the objective.** The goal is *ranking* trades by markout, not minimising MSE —
-   try a classification (good/bad) or quantile/asymmetric loss.
-5. **ETH validation at τ120/300 is still negative** (a March-regime effect the score-max cutoff
-   doesn't survive) — the calibration / objective items above target it.
+1. **Probability calibration** — only matters for a fixed/expected-value cutoff: the score-max
+   threshold is invariant to any monotone calibration, so the classifier/quantile scores need
+   isotonic/Platt only if we want them to read as probabilities for an EV rule.
+2. **Combine levers** — e.g. quantile **+** recency for ETH long-τ, or MAE **+** recency — untested
+   interactions that might beat the single-lever per-cell winners on the harness.
+3. **Confirm out-of-regime** — three OOS months is modest and the per-cell picks carry some
+   selection optimism; re-judge when more data (or a non-drawdown regime) is available.
 
 ### Features (deferred / harder)
 6. **True OFI / VPIN / sweep-runs** — BBO-based Cont-style order-flow imbalance, volume-bucketed

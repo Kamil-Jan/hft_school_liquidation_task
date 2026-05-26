@@ -5,7 +5,7 @@ missingness, univariate signal (weighted corr + mutual information), redundancy
 (correlation clustering), model permutation importance with train→val *stability*,
 PCA, and a top-N "how many features?" sweep that measures validation Score vs the
 number of features kept — per (symbol, horizon). Each section pairs a plot with a
-short written analysis. Run:  make feature-selection   (needs `make panel` first).
+short written analysis. Run:  make feature-nb   (needs `make panel` first).
 """
 import nbformat as nbf
 
@@ -31,6 +31,7 @@ the conclusions feed the `--n-features` pruning and the docs.
 5. PCA — does a linear projection help a tree model?
 6. How many features? — validation-Score-vs-N sweep
 7. Recommendations
+8. **Leak-free selection** — train-internal N-sweep + why the chosen features help (authoritative)
 """)
 
 md("## 0. Setup")
@@ -336,6 +337,110 @@ md(r"""
   nothing from decorrelation while losing interpretability.
 - Pruning helps BTC's overfitting; ETH's τ120/300 problem is **regime shift, not excess
   features** — it needs the calibration / monotonic-constraint / recency-weighting work instead.
+""")
+
+# ----------------------------------------------------------------------------
+md(r"""
+## 8. Leak-free selection — train-internal N-sweep + why the chosen features help
+
+§4 and §6 above rank/sweep on the **validation** month — useful as research, but a
+val-selection leak (it overfit March and hurt April). This section is the **authoritative,
+leak-free** view used to populate `config.FEATURE_SETS`:
+
+- **RANKER (MSE-HGBR):** importance permuted on a *train-internal* selection block (later
+  20% of TRAIN, embargoed) — `scripts/select_features.py`. Order-only, so a stable estimator.
+- **JUDGE (deployed estimator):** the N-sweep refits with the shipped per-`(sym,τ)` estimator
+  (`config.MODEL_SPECS`) and scores the same selection block, so N is tuned for what we deploy.
+  `pick_n` keeps the smallest N at (near-)peak Score (a parsimony knee).
+- **Adoption** is decided separately on the walk-forward OOS harness
+  (`scripts/walk_forward.py --specs features`, shipped-all vs shipped-curated), never here.
+
+Reads `artifacts/report/feature_selection_sweep.parquet` and `feature_explanations.parquet`
+(run `make feature-select` then `make feature-explain` first).
+""")
+code(r"""
+import os
+SW = config.ARTIFACTS_DIR / "report" / "feature_selection_sweep.parquet"
+EX = config.ARTIFACTS_DIR / "report" / "feature_explanations.parquet"
+have = SW.exists() and EX.exists()
+if not have:
+    print("run `make feature-select` then `make feature-explain` to populate this section")
+else:
+    sweep = pl.read_parquet(SW); expl = pl.read_parquet(EX)
+    fig, axes = plt.subplots(len(SYMS), len(TAUS), figsize=(15, 8), squeeze=False)
+    for r, s in enumerate(SYMS):
+        for c, tau in enumerate(TAUS):
+            t = sweep.filter((pl.col("sym") == s) & (pl.col("tau") == tau)).sort("n_selected")
+            ax = axes[r][c]
+            ax.plot(t["n_selected"], t["internal_score"], "-o", ms=4, color=COL[s])
+            ch = t.filter(pl.col("chosen"))
+            if ch.height:
+                ax.scatter(ch["n_selected"], ch["internal_score"], s=160, marker="*",
+                           color="k", zorder=5, label=f"chosen N={ch['n_selected'][0]}")
+            ax.axhline(float(t["internal_score_all"][0]), color="grey", ls=":", label="all-73")
+            ax.set_title(f"{s.upper()} τ={tau}s"); ax.legend(fontsize=8)
+            if c == 0: ax.set_ylabel("sel-block Score (bps)")
+            if r == len(SYMS)-1: ax.set_xlabel("# features (one per cluster)")
+    fig.suptitle("Leak-free N-sweep: train-internal Score vs feature count (deployed estimator)", y=1.0)
+    plt.tight_layout(rect=[0,0,1,0.97]); plt.show()
+""")
+md(r"""
+**Read:** the knee differs by symbol — BTC peaks at a small N and decays (extra features add
+variance on the low-signal symbol), while ETH's curve keeps climbing toward larger N (its edge
+is spread across more weak-but-real features). This reproduces §6's BTC-few / ETH-many shape
+*leak-free*. The `★` marks `pick_n`'s choice; the dotted line is all-73 — where the curve never
+clears it, the cell should keep all features (and the OOS gate confirms it).
+""")
+code(r"""
+if have:
+    # train quintile edge (top-bottom) of each explained feature, colored by sign,
+    # annotated with how many calendar months keep the train sign (regime survival).
+    fig, axes = plt.subplots(len(SYMS), len(TAUS), figsize=(16, 10), squeeze=False)
+    for r, s in enumerate(SYMS):
+        for c, tau in enumerate(TAUS):
+            e = (expl.filter((pl.col("sym") == s) & (pl.col("tau") == tau))
+                 .sort("imp_rank").head(15).to_pandas())
+            ax = axes[r][c]
+            colors = ["#2ca02c" if v >= 0 else "#d62728" for v in e["train_edge_bps"]]
+            ax.barh(range(len(e)), e["train_edge_bps"], color=colors)
+            ax.set_yticks(range(len(e))); ax.set_yticklabels(e["feature"], fontsize=7)
+            ax.invert_yaxis(); ax.axvline(0, color="k", lw=0.6)
+            for i, (_, row) in enumerate(e.iterrows()):
+                ax.text(row["train_edge_bps"], i, f" {row['months_consistent']}/{row['n_months']}",
+                        va="center", fontsize=6)
+            ax.set_title(f"{s.upper()} τ={tau}s");
+            if r == len(SYMS)-1: ax.set_xlabel("train edge: top−bottom quintile (bps)")
+    fig.suptitle("Why each feature helps: train quintile edge (color=sign) + months keeping the sign", y=1.0)
+    plt.tight_layout(rect=[0,0,1,0.97]); plt.show()
+""")
+code(r"""
+if have:
+    # Per-month edge-survival strip for one regime-sensitive cell (ETH τ300): does each
+    # chosen feature's top-bottom edge hold its sign across the 6 calendar months?
+    s, tau = "eth", 300
+    feats = (expl.filter((pl.col("sym") == s) & (pl.col("tau") == tau))
+             .sort("imp_rank").head(12)["feature"].to_list())
+    p = panels[s].with_columns(month=pl.from_epoch(pl.col("timestamp"), time_unit="us").dt.strftime("%Y-%m"))
+    months = sorted(p["month"].unique().to_list())
+    M = np.full((len(feats), len(months)), np.nan)
+    for i, f in enumerate(feats):
+        for j, m in enumerate(months):
+            cm = analysis.conditional_markout(p.filter(pl.col("month") == m), f, f"pnl_{tau}", 5)
+            d = dict(zip(cm["bucket"].to_list(), cm["wpnl"].to_list()))
+            M[i, j] = d.get("4", np.nan) - d.get("0", np.nan)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    vmax = np.nanpercentile(np.abs(M), 95)
+    sns.heatmap(pd.DataFrame(M, index=feats, columns=months), cmap="RdBu_r", center=0,
+                vmin=-vmax, vmax=vmax, ax=ax, cbar_kws={"label": "top−bottom edge (bps)"})
+    ax.set_title(f"{s.upper()} τ{tau}: per-month feature edge (sign flips = regime risk)")
+    plt.tight_layout(); plt.show()
+""")
+md(r"""
+**Read:** features whose color stays the same across all six months are the regime-robust
+reasons to keep a trade; columns that flip (notably **December** for both symbols and **March**
+for ETH) are exactly where the liquidation→reversion edge reverses — the regime sign-flip the
+quantile/recency estimators are chosen to weather. A feature with a strong train edge *and* a
+high months-consistent count (previous chart) is the kind the selection should prefer.
 """)
 
 # ----------------------------------------------------------------------------

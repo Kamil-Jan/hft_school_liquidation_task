@@ -11,7 +11,8 @@
 make test                          # fast unit tests (spec math + features + thresholds)
 make panel                         # rebuild artifacts/panel_<sym>.parquet after a feature change
 make train                         # refit models + thresholds + report after a panel/model change
-make study                         # single-feature conditional-markout study (reads panels)
+make walkforward WF_SPECS=...      # expanding-window OOS judge (baseline|regime|objective|features|shipped)
+make feature-select                # leak-free N-sweep -> FEATURE_SETS candidates (reads panels)
 make baselines                     # full-data PnL_all + turnover (reference; ~4 min)
 make eda                           # rebuild + execute notebooks/01_exploration.ipynb
 .venv/bin/python -m pytest         # tests directly

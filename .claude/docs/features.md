@@ -183,7 +183,7 @@ the sample weight), `day`, `split`, `dt`, and the labels `pnl_30` / `pnl_120` /
 pressure) > `ampl_300s` (volatility amplitude) — i.e. Bybit liquidations, time-of-day,
 and the volatility regime, confirming the cross-exchange-reversion thesis.
 
-## Feature-selection findings (notebook `02_feature_selection.ipynb`, `make feature-selection`)
+## Feature-selection findings (notebook `02_feature_selection.ipynb`, `make feature-nb`)
 
 A per-`(symbol, τ)` study (missingness, univariate corr/MI, correlation clustering,
 train→val permutation-importance stability, PCA, and a top-N validation-Score sweep):
@@ -247,4 +247,59 @@ not too-few-features.) The dedup-first method is sound; the flaw is **selecting 
 **Decision (reverted):** ship **all features** per model; `config.FEATURE_SETS = {}`. The notebook
 + `select_features.py` are kept. Feature selection is **deferred** — redo it **leak-free**: rank
 importance on a *train-internal* fold (split train into fit/selection), leaving val and test as
-honest checks, then populate `FEATURE_SETS` and confirm on test.
+honest checks, then populate `FEATURE_SETS` and confirm on test. **→ Done; see next section.**
+
+## Leak-free feature selection — chosen sets and why they help (2026-05-26)
+
+The redo (`scripts/select_features.py`, `make feature-select`) ranks importance leak-free and is
+judged on the walk-forward OOS harness — never on validation. Two estimators, two jobs (see
+[[feature-selection]] memory): a **RANKER** (MSE-HGBR, permuted on the later-20% *train-internal
+selection block*, embargoed) only *orders* features; a **JUDGE** (the deployed per-`(sym,τ)`
+estimator via `model.fit_model`) picks N by a train-internal sweep + parsimony knee (`pick_n`). The
+old hardcoded, val-derived `NMAP` is gone. Adoption is then decided **only** on the OOS gate
+(`python scripts/walk_forward.py --specs features`: `shipped_all_features` vs
+`shipped_curated_features`, identical except the feature set).
+
+**OOS verdict — all-73 wins 5/6 cells** (mean Score over Feb/Mar/Apr, all-73 → curated):
+
+| cell | all-73 | curated | Δ | curated worst-month |
+|---|---|---|---|---|
+| BTC τ30 | 1.61 | 1.48 | −0.13 | 1.11 |
+| BTC τ120 | 2.14 | 1.55 | −0.59 | 0.03 |
+| BTC τ300 | 1.99 | 1.24 | −0.74 | 0.36 |
+| ETH τ30 | 2.78 | **2.83** | +0.05 | 0.91 (vs 0.55) |
+| ETH τ120 | 2.72 | 2.04 | −0.68 | 0.58 |
+| ETH τ300 | 2.70 | 1.69 | −1.01 | **−2.43** (breaks March) |
+
+Only ETH τ30 passed, and only marginally (+0.05 mean — within 3-month noise — while giving up April
+3.60→3.25). **Decision: keep all features everywhere; `config.FEATURE_SETS = {}`.** The train-internal
+sweep had looked optimistic for BTC τ120/300 and ETH τ120/300 (curated > all internally) — exactly
+the optimism the OOS gate exists to catch. Note too that the clean **BTC-few / ETH-many** shape from
+the *validation* sweep above did **not** reproduce leak-free: the train-internal N-curves are flat and
+noisy (weak signal), so that asymmetry was itself partly a validation artifact.
+
+**Why all-73 is hard to beat (the "why they help" analysis,** `make feature-explain` →
+`feature_explanations.parquet`, notebook §8). For each leak-free-chosen feature we measured its TRAIN
+top−bottom-quintile edge (bps) and how many of the 6 calendar months keep that sign (regime
+survival). The edge is **spread across many consistent-sign features**, so dropping ~half (even
+keeping cluster representatives) loses signal without a variance payoff:
+
+- **Liquidation alignment is the strongest, most regime-robust family** (the core thesis, leak-free):
+  `bybit_liqalign_5s` edge **+1.7 / +2.3 / +3.1 / +4.2 bps** (BTC τ30 / BTC τ300 / ETH τ30 / ETH τ120),
+  `binance_liqalign_{5,300}s` and `bybit_liqalign_30s` similar — almost all hold their sign **5–6/6
+  months**. A liquidation aligned with the taker side reliably precedes the reversion the model keeps.
+- **Signed momentum into the trade** is the other heavy hitter: `ret_30s_signed` +2.8 (ETH τ120, 6/6)
+  / +3.5 (ETH τ300), `signed_vol_mom_{30,300}s` +1.9–3.5 (BTC τ300, ETH τ300), `ret_5s_signed` ~+2.9
+  — large positive edges, 5–6/6 survival.
+- **Cascade size / count**: `bybit_liqabs_300s` (+1.0 ETH τ30 6/6, +1.5 ETH τ300), `bybit_liqcnt_300s`,
+  `binance_liqabs_300s` — the report's #1 feature, confirmed.
+- **Volatility-regime gates carry a robust *negative* edge** (high vol ⇒ worse maker markout):
+  `vol_ts_ratio` −0.7 (BTC τ30/120, 6/6), `ampl_5s` −0.6 (BTC τ30, 6/6); `ampl_300s` flips *positive*
+  for ETH (+1.2/+1.4). Their sign-stability across all 6 months makes them reliable conditioners.
+- **Microstructure** `px_vs_mid_bps` is small but unusually stable (6/6 in several cells).
+- The features the selection *would* cut are a minority of flippy/weak ones — `trade_intensity_300s`,
+  `basis_bps`, `bybit_liq_runlen`, `micro_signed_bps` (only **2/6** months consistent). Cutting them
+  helps a little; cutting down to N≈25 also drops consistent-sign contributors, and the net is
+  negative OOS. **The signal is broad, not concentrated** — so the all-73 tree, which can lean on the
+  stable core and largely ignore the noise, is the right default. ETH τ300's curated 5-feature set is
+  the cautionary case: stripped to 5 it *amplifies* the March regime sign-flip (worst month −2.43).

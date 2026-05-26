@@ -174,6 +174,69 @@ def fig_monthly_stability(panels, steps, path: Path) -> None:
     fig.savefig(path, bbox_inches="tight"); plt.close(fig)
 
 
+# Core-thesis signal whose realised edge we track across months (signed, taker-aligned
+# Bybit liquidation pressure). Its top-minus-bottom-quintile markout spread = the edge.
+EDGE_FEATURE = "bybit_liqalign_300s"
+
+
+def regime_by_month(panels: dict[str, pl.DataFrame], steps: dict[str, int]) -> pl.DataFrame:
+    """Model-independent per-month regime table: realised edge, PnL_all, and vol level.
+
+    For each (symbol, calendar month): ``pnl_all_<tau>`` (unconditional w-weighted
+    markout — is there edge at all this month), ``edge_<tau>`` (top minus bottom quintile
+    w-markout of :data:`EDGE_FEATURE` — does the liquidation→reversion signal survive), and
+    ``rv_300s_med`` (the volatility regime). Quantifies the shift the model must generalise across.
+    """
+    rows = []
+    for sym, panel in panels.items():
+        p = panel.with_columns(
+            month=pl.from_epoch(pl.col("timestamp"), time_unit="us").dt.strftime("%Y-%m"))
+        for m in sorted(p["month"].unique().to_list()):
+            sub = p.filter(pl.col("month") == m)
+            rec = {"sym": sym, "month": m, "n": sub.height,
+                   "rv_300s_med": (round(float(sub["rv_300s"].median()), 4)
+                                   if "rv_300s" in sub.columns else float("nan"))}
+            for tau in config.TAUS:
+                pnl = f"pnl_{tau}"
+                rec[f"pnl_all_{tau}"] = round(analysis.weighted_markout(sub, pnl), 4)
+                cm = analysis.conditional_markout(sub, EDGE_FEATURE, pnl, 5)
+                d = dict(zip(cm["bucket"].to_list(), cm["wpnl"].to_list()))
+                rec[f"edge_{tau}"] = round(d.get("4", float("nan")) - d.get("0", float("nan")), 4)
+            rows.append(rec)
+    return pl.DataFrame(rows)
+
+
+def fig_regime_by_month(table: pl.DataFrame, path: Path) -> None:
+    """Edge (top) and PnL_all + vol (bottom) by month, per horizon — the regime picture."""
+    syms = sorted(table["sym"].unique().to_list())
+    fig, axes = plt.subplots(2, len(config.TAUS), figsize=(5 * len(config.TAUS), 7), squeeze=False)
+    for i, tau in enumerate(config.TAUS):
+        ax_e, ax_p = axes[0][i], axes[1][i]
+        for sym in syms:
+            t = table.filter(pl.col("sym") == sym).sort("month")
+            months = t["month"].to_list()
+            x = np.arange(len(months))
+            ax_e.plot(x, t[f"edge_{tau}"].to_numpy(), "o-", color=SYM_COLOR.get(sym, "#4c72b0"),
+                      ms=4, label=sym)
+            ax_p.plot(x, t[f"pnl_all_{tau}"].to_numpy(), "o-", color=SYM_COLOR.get(sym, "#4c72b0"),
+                      ms=4, label=sym)
+            if i == len(config.TAUS) - 1:  # vol context once, on a twin axis of the last col
+                axv = ax_p.twinx()
+                axv.plot(x, t["rv_300s_med"].to_numpy(), ":", color=SYM_COLOR.get(sym, "#888"),
+                         lw=1, alpha=0.7)
+                axv.set_ylabel("rv_300s median (dotted)", fontsize=8)
+        for ax in (ax_e, ax_p):
+            ax.axhline(0, color="k", lw=0.6)
+            ax.set_xticks(x); ax.set_xticklabels(months, rotation=45, fontsize=8)
+        ax_e.set_title(f"τ={tau}s")
+        if i == 0:
+            ax_e.set_ylabel(f"edge: {EDGE_FEATURE}\ntop−bottom quintile (bps)"); ax_e.legend(fontsize=8)
+            ax_p.set_ylabel("PnL_all (w-mean markout, bps)")
+    fig.suptitle("Per-month regime: realised liquidation edge (top) vs unconditional markout + vol (bottom)", y=1.0)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(path, bbox_inches="tight"); plt.close(fig)
+
+
 def fig_feature_importance(models: dict, panels: dict[str, pl.DataFrame],
                            features_by: dict, path: Path,
                            n_sample: int = 60_000, top: int = 18) -> None:
@@ -218,9 +281,13 @@ def generate(panels: dict[str, pl.DataFrame], steps: dict[str, int],
     metrics = evaluate(panels, steps, thresholds)
     metrics.write_parquet(outdir / "metrics.parquet")
 
+    regime = regime_by_month(panels, steps)
+    regime.write_parquet(outdir / "regime_by_month.parquet")
+
     fig_threshold_curves(panels, steps, thresholds, figs / "threshold_curves.png")
     fig_pred_vs_realized(panels, figs / "pred_vs_realized.png")
     fig_monthly_stability(panels, steps, figs / "monthly_stability.png")
+    fig_regime_by_month(regime, figs / "regime_by_month.png")
     fig_feature_importance(models, panels, features_by, figs / "feature_importance.png")
 
     _write_markdown(metrics, thresholds, outdir)
@@ -235,10 +302,48 @@ def _md_table(df: pl.DataFrame) -> str:
     return "\n".join(out)
 
 
+def _spec_section() -> list[str]:
+    """Markdown table of the per-(symbol, τ) estimator each model is trained with."""
+    rows = [{"sym": s, "tau": t, "kind": spec["kind"],
+             "detail": ", ".join(f"{k}={v}" for k, v in spec.items() if k != "kind") or "—"}
+            for (s, t), spec in sorted(config.MODEL_SPECS.items())]
+    return ["## Model per (symbol, τ)  — `config.MODEL_SPECS`", "",
+            "Chosen by the walk-forward OOS study (`make walkforward`); cells absent here use "
+            "the HistGBR-MSE default. The submission `predict` path is uniform across kinds.", "",
+            _md_table(pl.DataFrame(rows).sort(["sym", "tau"])), ""]
+
+
+def _walkforward_section(outdir: Path) -> list[str]:
+    """Mean ± std OOS Score per (sym, τ, spec) from a walk-forward parquet, if one exists.
+
+    Prefers ``walkforward_shipped.parquet`` (baseline vs the deployed config); this is the
+    honest multi-month read behind the estimator choices. Absent ⇒ a pointer to generate it.
+    """
+    pref = outdir / "walkforward_shipped.parquet"
+    cands = [pref] if pref.exists() else sorted(outdir.glob("walkforward_*.parquet"))
+    if not cands:
+        return ["## Walk-forward OOS Score", "",
+                "_Run `make walkforward --specs shipped` to populate this (mean Score over the "
+                "held-out months Feb/Mar/Apr)._", ""]
+    long = pl.read_parquet(cands[0])
+    summary = (long.group_by(["sym", "tau", "spec"]).agg(
+                   mean_score=pl.col("score").mean().round(3),
+                   std_score=pl.col("score").std().round(3),
+                   min_score=pl.col("score").min().round(3))
+               .sort(["sym", "tau", "spec"]))
+    months = ", ".join(sorted(long["month"].unique().to_list()))
+    return [f"## Walk-forward OOS Score  (`{cands[0].name}`)", "",
+            f"Mean/std/min Score across held-out months ({months}) — the regime-robust judge "
+            "behind the per-cell estimator choices. Higher mean, smaller downside is better.", "",
+            _md_table(summary), ""]
+
+
 def _write_markdown(metrics: pl.DataFrame, thresholds, outdir: Path) -> None:
     lines = ["# Liquidation-filter results report", "",
              "Held-out metrics per symbol, split & horizon (Score = PnL_kept − PnL_all; "
              "turnover floor 500k USD/day). Splits: validation, plus test when USE_TEST.", ""]
+    lines += _spec_section()
+    lines += _walkforward_section(outdir)
     pivot = (metrics.filter(pl.col("method") != "baseline_keep_all")
              .pivot(values="score", index=["sym", "split", "tau"], on="method", aggregate_function="first")
              .sort(["sym", "split", "tau"]))
@@ -252,5 +357,6 @@ def _write_markdown(metrics: pl.DataFrame, thresholds, outdir: Path) -> None:
               "![Score vs kept fraction](figs/threshold_curves.png)", "",
               "![Predicted vs realised markout](figs/pred_vs_realized.png)", "",
               "![Per-month stability](figs/monthly_stability.png)", "",
+              "![Per-month regime (edge + vol)](figs/regime_by_month.png)", "",
               "![Feature importance by horizon](figs/feature_importance.png)", ""]
     (outdir / "report.md").write_text("\n".join(lines))

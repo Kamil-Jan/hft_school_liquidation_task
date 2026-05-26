@@ -76,12 +76,39 @@ TURNOVER_MIN_PER_DAY: float = 500_000.0        # kept-trade clipped turnover flo
 # `make train N_FEATURES=30` / `train_model.py --n-features 30`.
 N_FEATURES: int | None = None
 
-# Curated per-(symbol, τ) feature sets. Used by `train_model` per model when non-empty
-# (precedence: --n-features > FEATURE_SETS > all features). **Currently empty ⇒ all
-# features.** A first cut (notebook 02 / `scripts/select_features.py`, redundancy-filtered
-# then top-N by *validation* importance) was reverted: ranking on validation overfit it and
-# **hurt the held-out test** (see .claude/docs/features.md). Re-derive leak-free (rank on a train-internal
-# fold, val/test untouched) before populating this. The script is kept for that redo.
+# ---------------------------------------------------------------------------
+# Per-(symbol, tau) estimator choice — picked by the walk-forward OOS study
+# ---------------------------------------------------------------------------
+# Each cell uses the estimator that won mean out-of-sample Score across the held-out
+# months (Feb/Mar/Apr) in the walk-forward backtest (`make walkforward --specs ...`;
+# see .claude/docs/findings.md). `model.fit_model` dispatches on this:
+#   hgbr           — HistGradientBoostingRegressor; optional `loss` and/or
+#                    `recency_halflife_days` (exp-decayed sample weights)
+#   lgbm_quantile  — LightGBM quantile regressor (`alpha`); conservative ⇒ robust to the
+#                    regime sign-flips that wrecked ETH long-horizon validation.
+# Robust MAE beats MSE almost everywhere; LightGBM quantile turns ETH τ120/300's negative
+# March Score positive. NB: the two lgbm cells make the submission import lightgbm.
+DEFAULT_MODEL_SPEC: dict = {"kind": "hgbr"}                       # = baseline MSE
+MODEL_SPECS: dict[tuple[str, int], dict] = {
+    ("btc", 30):  {"kind": "hgbr", "loss": "absolute_error"},
+    ("btc", 120): {"kind": "hgbr", "loss": "absolute_error"},
+    ("btc", 300): {"kind": "hgbr", "recency_halflife_days": 30},
+    ("eth", 30):  {"kind": "hgbr", "loss": "absolute_error"},
+    ("eth", 120): {"kind": "lgbm_quantile", "alpha": 0.50},
+    ("eth", 300): {"kind": "lgbm_quantile", "alpha": 0.60},
+}
+
+# Curated per-(symbol, τ) feature sets. Used by `train_model` per model when present
+# (precedence: --n-features > FEATURE_SETS > all features); an absent key ⇒ all features.
+# >>> EMPTY ON PURPOSE (2026-05-26): leak-free selection (`scripts/select_features.py`,
+# train-internal N-sweep) was derived and judged on the walk-forward OOS gate
+# (`scripts/walk_forward.py --specs features`, shipped-estimator all vs curated). **All-73
+# won 5/6 cells on mean OOS** (btc 30/120/300 −0.13/−0.59/−0.74; eth 120/300 −0.68/−1.01,
+# eth 300 even breaks March to −2.43); only eth τ30 passed and only marginally (+0.05 mean,
+# within noise), so we keep all features everywhere. The edge is spread across many
+# consistent-sign features, so pruning loses signal without a variance payoff — see
+# .claude/docs/features.md ("Leak-free feature selection"). Artifacts:
+# artifacts/report/feature_selection_sweep.parquet, feature_explanations.parquet.
 FEATURE_SETS: dict[tuple[str, int], list[str]] = {}
 
 # ---------------------------------------------------------------------------

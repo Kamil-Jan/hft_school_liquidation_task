@@ -544,6 +544,95 @@ md(r"""
 """)
 
 # ----------------------------------------------------------------------------
+md(r"""### 6.4 Anatomy of a liquidation cascade — what to watch before, during & after
+
+§6.2 looked at *single* liquidations; real moves come in **cascades**. A cascade = a cluster of
+liquidations (**both** venues, Bybit at its +200 ms available time) with gaps < 10 s and ≥ 5 prints
+(~21 k per symbol, median span ≈ 13 s). We anchor at the cascade **begin** and average, over all
+cascades, what the Binance microstructure does — so we can see which signals are worth watching
+`pre → begin → middle → end → after`. Built by `scripts/eda/precompute_cascades.py` (`make eda`).
+The mid move and signed series are **pressure-signed** (up = *into* the liquidation direction); the
+trade/spread series are shown **relative to their pre-cascade level** (so BTC and ETH overlay).
+""")
+code(r"""
+# event-time profiles of trade intensity + BBO microstructure around the cascade begin
+PHASES = ["pre","begin","middle","end","after"]
+def _basenorm(y, x):
+    b = np.nanmean(y[x < 0]); return y/b if b and np.isfinite(b) else y
+PANELS = [("mid_disp_bps","mid move, pressure dir (bps)","raw"),
+          ("trade_rate","trade intensity (x pre)","norm"),
+          ("flow_signed","signed taker flow (x pre)","norm"),
+          ("spread_bps","BBO spread (x pre)","norm"),
+          ("obi_signed","book imbalance, pressure-signed","raw"),
+          ("bybit_share","Bybit share of liq notional","share")]
+fig, axes = plt.subplots(2, 3, figsize=(15, 7.6))
+for ax, (coln, lab, mode) in zip(axes.ravel(), PANELS):
+    for sym in SYMS:
+        pr = pl.read_parquet(ART/f"cascade_profile_{sym}.parquet").sort("offset_s")
+        meta = pl.read_parquet(ART/f"cascade_meta_{sym}.parquet")
+        x = pr["offset_s"].to_numpy()
+        if mode == "share":
+            bn, yn = pr["binance_notional"].to_numpy(), pr["bybit_notional"].to_numpy()
+            tot = bn + yn
+            y = np.where(tot >= 0.1*np.nanmax(tot), yn/np.maximum(tot,1e-9), np.nan)
+        else:
+            y = pr[coln].to_numpy(); y = _basenorm(y, x) if mode=="norm" else y
+        ax.plot(x, y, color=COL[sym], lw=1.7, label=sym.upper())
+        ex = float(meta["median_end_off_s"][0])
+    ax.axvspan(0, ex, color="grey", alpha=0.08); ax.axvline(0, color="grey", lw=0.8, ls="--")
+    ax.set_xscale("symlog", linthresh=5)
+    ax.axhline({"norm":1,"share":0.5}.get(mode,0), color="k", lw=0.4)
+    ax.set_title(lab, fontsize=10); ax.legend(fontsize=8); ax.set_xlabel("s from begin (symlog)")
+fig.suptitle("Microstructure around a liquidation cascade (anchored at begin; grey band = typical span)", y=1.0)
+plt.tight_layout(rect=[0,0,1,0.97]); plt.show()
+""")
+code(r"""
+# the same signals as discrete phases (bars = BTC vs ETH); last panel = the maker markout
+P2 = [("trade_rate","trade intensity (x pre)","norm_pre"),
+      ("spread_bps","spread (x pre)","norm_pre"),
+      ("flow_signed","signed taker flow (x pre)","norm_pre"),
+      ("obi_signed","book imbalance (signed)","raw"),
+      ("mid_disp_bps","mid displacement (bps)","raw"),
+      ("pnl_120","maker markout pnl_120 (bps)","raw")]
+ph = {s: pl.DataFrame({"phase": PHASES}).join(
+        pl.read_parquet(ART/f"cascade_phase_{s}.parquet"), on="phase", how="left") for s in SYMS}
+fig, axes = plt.subplots(2, 3, figsize=(15, 7.6)); xs = np.arange(len(PHASES)); w = 0.38
+for ax, (coln, lab, mode) in zip(axes.ravel(), P2):
+    for k, sym in enumerate(SYMS):
+        y = ph[sym][coln].to_numpy().astype(float)
+        if mode == "norm_pre": y = y / y[0]
+        ax.bar(xs + (k-0.5)*w, y, w, color=COL[sym], label=sym.upper())
+    ax.set_xticks(xs); ax.set_xticklabels(PHASES)
+    ax.axhline(1 if mode=="norm_pre" else 0, color="k", lw=0.4)
+    ax.set_title(lab, fontsize=10); ax.legend(fontsize=8)
+fig.suptitle("By cascade phase: trade flow / book / markout before -> during -> after (bars = BTC vs ETH)", y=1.0)
+plt.tight_layout(rect=[0,0,1,0.97]); plt.show()
+""")
+md(r"""
+**What to watch, phase by phase** (series are × the pre-cascade level unless in bps):
+
+* **Pre (the lull).** No prints yet, but the mid is already drifting toward the coming extreme and
+  the maker markout `pnl_120` is **strongly negative** (≈ −1.5 bps BTC, −2.1 bps ETH) — the danger
+  zone: a fill here is run over by the move about to print.
+* **Begin.** The onset is a **flow + volatility burst**: trade intensity ≈ **2×**, signed taker
+  flow ≈ **3–3.6×**, and the **spread widens ≈ 1.5–1.6×** as liquidity providers back off. This is
+  the cleanest *real-time* tell that a cascade is firing.
+* **Middle → end.** The mid reaches its extreme; the **book imbalance flips** from leaning *with*
+  the pressure (pre/begin) to *against* it (end/after) as resting size rebuilds on the far side —
+  the microstructure signature of the turn. The markout has already crossed to **positive**.
+* **After.** Intensity, flow and spread decay back to baseline; the markout **stays positive**
+  (≈ +0.06–0.14 BTC, +0.2–0.36 ETH) — fills placed during/after the cluster sit on the reversion.
+* **Bybit vs Binance.** Bybit carries **~60–65 % of the cascade's liquidation notional** throughout
+  (bottom-right panel) — consistent with §6.2/§6.3 that it is the louder read of the same event.
+
+**Takeaway for the filter:** the watchable precursors are the **surge in trade intensity + signed
+taker flow + spread** and the **book-imbalance flip**; the maker edge swings from **negative in
+pre/begin** (run over by the continuation) to **positive in middle/end/after** (the reversion). A
+good signal must read the cascade's *phase*, not just its presence — which is what the windowed
+flow / liq / vol features encode.
+""")
+
+# ----------------------------------------------------------------------------
 md(r"""
 ## 7. Anomalies & things that look odd
 

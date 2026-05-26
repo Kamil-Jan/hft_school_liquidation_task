@@ -10,6 +10,15 @@ Usage:  python scripts/train_model.py [--symbols btc eth] [--min-keep-frac 0.05]
 from __future__ import annotations
 
 import argparse
+import os
+import warnings
+
+# LightGBM's sklearn wrapper warns when predicting on a nameless array (we fit/predict with
+# numpy throughout); harmless and noisy across permutation-importance repeats. Filter it in
+# this process *and* in the joblib/loky workers permutation_importance spawns (via the env
+# var, which a fresh worker interpreter reads at startup).
+os.environ.setdefault("PYTHONWARNINGS", "ignore::UserWarning")
+warnings.filterwarnings("ignore", message="X does not have valid feature names")
 
 import numpy as np
 import polars as pl
@@ -40,18 +49,18 @@ def _top_features(mdl, panels, features: list[str], tau: int, n_keep: int,
 
 def _fit_tau(train: pl.DataFrame, tau: int, features: list[str], args,
              panel_for_imp: pl.DataFrame, step: float, symbol: str):
-    """Fit one (symbol, horizon) on ``train`` (optionally prune + refit), fit the
-    purged-CV threshold, persist, and return ``(model, feats, threshold, cv)``."""
-    mdl, feats = model.train_markout_model(train, tau, features=features)
+    """Fit one (symbol, horizon) on ``train`` using its chosen estimator spec (optionally
+    prune + refit), fit the purged-CV threshold, persist, and return ``(model, feats, threshold, cv)``."""
+    mdl, kind, feats = model.fit_model(train, tau, symbol, features=features)
     if args.n_features is not None and 0 < args.n_features < len(features):
         feats = _top_features(mdl, {symbol: panel_for_imp}, features, tau, args.n_features)
-        mdl, feats = model.train_markout_model(train, tau, features=feats)
+        mdl, kind, feats = model.fit_model(train, tau, symbol, features=feats)
     ptr = train.with_columns(pl.Series(f"score_{tau}", model.predict_markout(mdl, train, feats)))
     thr, cv = analysis.fit_score_threshold(
         ptr[f"score_{tau}"].to_numpy(), ptr[f"pnl_{tau}"].to_numpy(),
         ptr["w"].to_numpy(), ptr["timestamp"].to_numpy(),
         step=step, min_keep_frac=args.min_keep_frac)
-    model.save(mdl, feats, tau, symbol, threshold=thr)
+    model.save(mdl, feats, tau, symbol, threshold=thr, kind=kind)
     return mdl, feats, thr, cv
 
 
@@ -72,7 +81,10 @@ def main() -> None:
     use_sets = (not prune) and bool(config.FEATURE_SETS)
     mode = (f"pruning to top-{args.n_features}" if prune
             else "curated config.FEATURE_SETS" if use_sets else "all features")
-    print(f"{len(features)} features; symbols={args.symbols}; per-symbol models; {mode}")
+    print(f"{len(features)} features; symbols={args.symbols}; per-(sym,tau) estimator specs; {mode}")
+    for (s, t), spec in sorted(config.MODEL_SPECS.items()):
+        if s in args.symbols:
+            print(f"    ({s}, {t}): {spec}")
 
     # one model per (symbol, tau). Feature set precedence: --n-features > FEATURE_SETS > all.
     models: dict = {}
